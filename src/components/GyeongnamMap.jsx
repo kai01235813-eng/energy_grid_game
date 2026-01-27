@@ -32,18 +32,22 @@ const GyeongnamMap = ({ selectedRegion, gameState, onCityClick }) => {
   return (
     <div 
       className="relative w-full h-full min-h-[600px] rounded-xl overflow-hidden border-2 border-cyber-blue shadow-2xl"
-      style={{
-        backgroundImage: `url(${mapImage})`,
-        backgroundSize: 'cover',
-        backgroundPosition: 'center',
-        backgroundRepeat: 'no-repeat',
-      }}
     >
+      {/* 배경 지도 이미지 레이어 (z-index: 0) */}
+      <div 
+        className="absolute inset-0 z-0"
+        style={{
+          backgroundImage: `url(${mapImage})`,
+          backgroundSize: 'contain',
+          backgroundPosition: 'center',
+          backgroundRepeat: 'no-repeat',
+        }}
+      />
       {gameState?.phase === 'initial' && (
         <motion.div
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
-          className="absolute inset-0 bg-black bg-opacity-80 flex items-center justify-center z-20 backdrop-blur-sm"
+          className="absolute inset-0 bg-black bg-opacity-80 flex items-center justify-center z-30 backdrop-blur-sm"
         >
           <div className="text-center">
             <AlertCircle className="w-20 h-20 text-cyber-red mx-auto mb-4 animate-pulse" />
@@ -57,7 +61,7 @@ const GyeongnamMap = ({ selectedRegion, gameState, onCityClick }) => {
       )}
 
       <div 
-        className="absolute inset-0 pointer-events-none"
+        className="absolute inset-0 pointer-events-none z-1"
         style={{
           background: `linear-gradient(180deg, 
             rgba(0, 212, 255, 0.05) 0%, 
@@ -77,11 +81,12 @@ const GyeongnamMap = ({ selectedRegion, gameState, onCityClick }) => {
         return (
           <motion.div
             key={city.id}
-            className="absolute cursor-pointer"
+            className="absolute cursor-pointer z-10"
             style={{
               left: `${leftPercent}%`,
               top: `${topPercent}%`,
               transform: 'translate(-50%, -50%)',
+              filter: 'drop-shadow(0 0 8px rgba(0, 212, 255, 0.6))',
             }}
             whileHover={{ scale: 1.2 }}
             onClick={() => onCityClick && onCityClick(city)}
@@ -136,11 +141,12 @@ const GyeongnamMap = ({ selectedRegion, gameState, onCityClick }) => {
         return (
           <motion.div
             key={index}
-            className="absolute"
+            className="absolute z-10"
             style={{
               left: `${leftPercent}%`,
               top: `${topPercent}%`,
               transform: 'translate(-50%, -50%)',
+              filter: 'drop-shadow(0 0 6px rgba(74, 222, 128, 0.5))',
             }}
             whileHover={{ scale: 1.15 }}
           >
@@ -189,8 +195,7 @@ const GyeongnamMap = ({ selectedRegion, gameState, onCityClick }) => {
         return (
           <svg 
             key={index}
-            className="absolute inset-0 w-full h-full pointer-events-none"
-            style={{ zIndex: 1 }}
+            className="absolute inset-0 w-full h-full pointer-events-none z-5"
           >
             <motion.line
               x1={`${fromLeftPercent}%`}
@@ -198,7 +203,7 @@ const GyeongnamMap = ({ selectedRegion, gameState, onCityClick }) => {
               x2={`${toLeftPercent}%`}
               y2={`${toTopPercent}%`}
               stroke={conn.isPowered ? '#00d4ff' : '#4b5563'}
-              strokeWidth="2"
+              strokeWidth="4"
               strokeDasharray="5,5"
               initial={{ pathLength: 0 }}
               animate={{ 
@@ -221,12 +226,12 @@ const GyeongnamMap = ({ selectedRegion, gameState, onCityClick }) => {
         return (
           <motion.div
             key={building.id}
-            className="absolute"
+            className="absolute z-15"
             style={{
               left: `${leftPercent}%`,
               top: `${topPercent}%`,
               transform: 'translate(-50%, -50%)',
-              zIndex: 5,
+              filter: 'drop-shadow(0 0 10px rgba(0, 212, 255, 0.8))',
             }}
             initial={{ scale: 0, rotate: -180 }}
             animate={{ scale: 1, rotate: 0 }}
@@ -254,7 +259,7 @@ const GyeongnamMap = ({ selectedRegion, gameState, onCityClick }) => {
         );
       })}
 
-      <div className="absolute bottom-4 left-4 bg-cyber-dark bg-opacity-95 rounded-lg p-4 border-2 border-cyber-blue z-10 backdrop-blur-sm">
+      <div className="absolute bottom-4 left-4 bg-cyber-dark bg-opacity-95 rounded-lg p-4 border-2 border-cyber-blue z-20 backdrop-blur-sm">
         <h3 className="text-sm font-bold text-cyber-blue mb-3 flex items-center gap-2">
           <Zap className="w-4 h-4" />
           범례
@@ -280,7 +285,7 @@ const GyeongnamMap = ({ selectedRegion, gameState, onCityClick }) => {
       </div>
 
       {regionData && (
-        <div className="absolute top-4 right-4 bg-cyber-dark bg-opacity-95 rounded-lg p-3 border-2 border-cyber-purple z-10 backdrop-blur-sm">
+        <div className="absolute top-4 right-4 bg-cyber-dark bg-opacity-95 rounded-lg p-3 border-2 border-cyber-purple z-20 backdrop-blur-sm">
           <div className="text-sm font-bold text-cyber-purple mb-1">{regionData.name}</div>
           <div className="text-xs text-gray-400">{regionData.description}</div>
           <div className="mt-2 text-xs">

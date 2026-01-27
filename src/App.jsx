@@ -7,6 +7,7 @@ import GyeongnamMap from './components/GyeongnamMap';
 import StarterPackUI from './components/StarterPackUI';
 import EconomyPanel from './components/EconomyPanel';
 import GridReconnectedEffect from './components/GridReconnectedEffect';
+import DevPanel from './components/DevPanel';
 import { Power, Zap } from 'lucide-react';
 
 function App() {
@@ -57,6 +58,18 @@ function App() {
         gainExp(500); // 보상
       }
     }
+  };
+
+  // 개발자 모드: 돈 충전
+  const handleAddMoney = () => {
+    gainExp(1000);
+    convertExpToCoins(1000);
+  };
+
+  // 개발자 모드: 강제 전력 공급
+  const handleForceLight = () => {
+    simulatePowerFlow();
+    setShowReconnectedEffect(true);
   };
 
   // 첫 번째 미배치 건물을 자동으로 선택
@@ -179,6 +192,14 @@ function App() {
           />
         )}
       </AnimatePresence>
+
+      {/* 개발자 패널 */}
+      <DevPanel
+        gameState={gameState}
+        onAddMoney={handleAddMoney}
+        onResetGame={resetGame}
+        onForceLight={handleForceLight}
+      />
 
       {/* 개발자 리셋 버튼 */}
       <button
