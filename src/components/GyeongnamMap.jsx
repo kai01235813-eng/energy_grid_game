@@ -1,27 +1,45 @@
 import React, { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { GYEONGNAM_CITIES, REGIONS } from '../constants/gameConfig';
-import { Home, Factory, Zap, AlertCircle } from 'lucide-react';
-// 실제 경남 지도 이미지 임포트
+import { Home, Factory, Zap, AlertCircle, Loader2 } from 'lucide-react';
 import mapImage from '../../map_bg.jpg';
 
 const GyeongnamMap = ({ selectedRegion, gameState, onCityClick }) => {
   const [hoveredCity, setHoveredCity] = useState(null);
+  const [imageLoaded, setImageLoaded] = useState(false);
   const regionData = REGIONS[selectedRegion];
+
+  // 이미지 프리로드
+  React.useEffect(() => {
+    const img = new Image();
+    img.src = mapImage;
+    img.onload = () => setImageLoaded(true);
+    img.onerror = () => setImageLoaded(true); // 에러 시에도 진행
+  }, []);
+
+  // 로딩 중 화면
+  if (!imageLoaded) {
+    return (
+      <div className="relative w-full h-full min-h-[600px] rounded-xl overflow-hidden border-2 border-cyber-blue shadow-2xl bg-cyber-dark flex items-center justify-center">
+        <div className="text-center">
+          <Loader2 className="w-16 h-16 text-cyber-blue animate-spin mx-auto mb-4" />
+          <p className="text-cyber-blue text-lg">지도 로딩 중...</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div 
-      className="relative w-full h-full rounded-xl overflow-hidden border-2 border-cyber-blue shadow-2xl"
+      className="relative w-full h-full min-h-[600px] rounded-xl overflow-hidden border-2 border-cyber-blue shadow-2xl"
       style={{
-        // 실제 경남 지도를 배경으로 설정 (추상적 그리드 제거)
         backgroundImage: `url(${mapImage})`,
         backgroundSize: 'cover',
         backgroundPosition: 'center',
         backgroundRepeat: 'no-repeat',
       }}
     >
-      {/* 블랙아웃 오버레이 - 전력 차단 시 지도 위를 어둡게 덮음 */}
-      {gameState.phase === 'initial' && (
+      {gameState?.phase === 'initial' && (
         <motion.div
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
@@ -38,7 +56,6 @@ const GyeongnamMap = ({ selectedRegion, gameState, onCityClick }) => {
         </motion.div>
       )}
 
-      {/* 사이버펑크 오버레이 레이어 - 실제 지도 위에 네온 효과 추가 */}
       <div 
         className="absolute inset-0 pointer-events-none"
         style={{
@@ -51,297 +68,192 @@ const GyeongnamMap = ({ selectedRegion, gameState, onCityClick }) => {
         }}
       />
 
-      {/* 도시 노드 및 설비 배치 컨테이너 - 절대 좌표 기반 */}
-      <div className="absolute inset-0">
-        {/* 도시 노드 렌더링 - 퍼센트 기반 절대 좌표로 실제 지도 위에 배치 */}
-        {GYEONGNAM_CITIES.map((city, index) => {
-          const isSelected = city.id === selectedRegion;
-          const isPowered = gameState.phase === 'operational';
-          const isBlackout = gameState.phase === 'initial';
+      {GYEONGNAM_CITIES.map((city) => {
+        const cityState = gameState?.cities?.find(c => c.id === city.id);
+        const isPowered = cityState?.isPowered || false;
+        const leftPercent = (city.x / 800) * 100;
+        const topPercent = (city.y / 600) * 100;
 
-          return (
+        return (
+          <motion.div
+            key={city.id}
+            className="absolute cursor-pointer"
+            style={{
+              left: `${leftPercent}%`,
+              top: `${topPercent}%`,
+              transform: 'translate(-50%, -50%)',
+            }}
+            whileHover={{ scale: 1.2 }}
+            onClick={() => onCityClick && onCityClick(city)}
+            onMouseEnter={() => setHoveredCity(city.id)}
+            onMouseLeave={() => setHoveredCity(null)}
+          >
             <motion.div
-              key={city.id}
-              className="absolute cursor-pointer group"
-              style={{
-                // 실제 지도 이미지 위의 절대 좌표 (퍼센트 기반)
-                // x, y 값을 800x600 기준에서 퍼센트로 변환
-                left: `${(city.x / 800) * 100}%`,
-                top: `${(city.y / 600) * 100}%`,
-                transform: 'translate(-50%, -50%)', // 중앙 정렬
-              }}
-              initial={{ opacity: 0, scale: 0 }}
-              animate={{ opacity: 1, scale: 1 }}
-              transition={{ delay: index * 0.1 }}
-              onClick={() => onCityClick?.(city)}
-              onMouseEnter={() => setHoveredCity(city.id)}
-              onMouseLeave={() => setHoveredCity(null)}
-            >
-              {/* 전력 공급 시 글로우 효과 */}
-              {!isBlackout && isPowered && (
+              className={`w-4 h-4 rounded-full border-2 ${
+                isPowered 
+                  ? 'bg-cyber-blue border-cyber-blue shadow-[0_0_15px_rgba(0,212,255,0.8)]' 
+                  : 'bg-gray-700 border-gray-500'
+              }`}
+              animate={isPowered ? {
+                boxShadow: [
+                  '0 0 15px rgba(0, 212, 255, 0.8)',
+                  '0 0 25px rgba(0, 212, 255, 1)',
+                  '0 0 15px rgba(0, 212, 255, 0.8)',
+                ],
+              } : {}}
+              transition={{ duration: 2, repeat: Infinity }}
+            />
+            
+            <AnimatePresence>
+              {hoveredCity === city.id && (
                 <motion.div
-                  className="absolute inset-0 rounded-full blur-xl"
-                  style={{
-                    width: '60px',
-                    height: '60px',
-                    background: `radial-gradient(circle, ${regionData?.color || '#00d4ff'}80, transparent)`,
-                    transform: 'translate(-50%, -50%)',
-                    left: '50%',
-                    top: '50%',
-                  }}
-                  animate={{
-                    scale: [1, 1.3, 1],
-                    opacity: [0.5, 0.8, 0.5],
-                  }}
-                  transition={{ duration: 2, repeat: Infinity }}
-                />
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: 10 }}
+                  className="absolute top-6 left-1/2 transform -translate-x-1/2 bg-cyber-dark bg-opacity-95 rounded-lg p-2 border border-cyber-blue whitespace-nowrap z-30 backdrop-blur-sm"
+                >
+                  {/* 수정: name과 type이 문자열인지 확인 */}
+                  <div className="text-xs font-bold text-cyber-blue">{String(city?.name || '도시')}</div>
+                  <div className="text-xs text-gray-400">
+                    {city?.type === 'industrial' ? '산업' : city?.type === 'tech' ? '기술' : '주거'}
+                  </div>
+                  <div className="text-xs text-yellow-400">
+                    {isPowered ? '⚡ 전력공급' : '● 대기중'}
+                  </div>
+                </motion.div>
               )}
+            </AnimatePresence>
+          </motion.div>
+        );
+      })}
 
-              {/* 도시 노드 메인 원 */}
-              <motion.div
-                className={`
-                  relative z-10 rounded-full border-2 flex items-center justify-center
-                  ${isBlackout ? 'bg-gray-800 border-gray-600' : 'bg-cyber-dark border-cyber-blue'}
-                  ${isSelected ? 'w-8 h-8 border-4' : 'w-6 h-6'}
-                `}
-                style={{
-                  borderColor: isBlackout ? '#555' : (isSelected ? regionData?.color : '#00d4ff'),
-                  backgroundColor: isBlackout ? '#333' : (isSelected ? `${regionData?.color}40` : '#0a0e2780'),
-                  boxShadow: !isBlackout ? `0 0 20px ${isSelected ? regionData?.color : '#00d4ff'}80` : 'none',
-                }}
-                animate={{
-                  scale: hoveredCity === city.id ? 1.3 : 1,
-                }}
-              >
-                {isSelected && (
-                  <Zap className="w-4 h-4" style={{ color: regionData?.color }} />
-                )}
-              </motion.div>
+      {(gameState?.demandPoints || []).map((point, index) => {
+        const isPowered = point.power > 0;
+        const Icon = point.type === 'village' ? Home : Factory;
+        const leftPercent = (point.x / 800) * 100;
+        const topPercent = (point.y / 600) * 100;
 
-              {/* 선택된 지역 펄스 효과 */}
-              {isSelected && (
-                <motion.div
-                  className="absolute inset-0 rounded-full border-2"
-                  style={{
-                    borderColor: regionData?.color,
-                    width: '40px',
-                    height: '40px',
-                    transform: 'translate(-50%, -50%)',
-                    left: '50%',
-                    top: '50%',
-                  }}
-                  animate={{
-                    scale: [1, 1.8, 1],
-                    opacity: [0.8, 0, 0.8],
-                  }}
-                  transition={{ duration: 2, repeat: Infinity }}
-                />
-              )}
-
-              {/* 도시 이름 라벨 */}
-              <motion.div
-                className={`
-                  absolute top-full mt-2 whitespace-nowrap text-sm font-bold
-                  ${isBlackout ? 'text-gray-600' : 'text-white drop-shadow-lg'}
-                `}
-                style={{
-                  left: '50%',
-                  transform: 'translateX(-50%)',
-                  textShadow: !isBlackout ? '0 0 10px rgba(0, 0, 0, 0.8)' : 'none',
-                }}
-              >
-                {city.name}
-              </motion.div>
-
-              {/* Hover 정보 툴팁 */}
-              <AnimatePresence>
-                {hoveredCity === city.id && (
-                  <motion.div
-                    initial={{ opacity: 0, y: -10 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -10 }}
-                    className="absolute left-1/2 -translate-x-1/2 bottom-full mb-8 bg-cyber-dark border-2 border-cyber-blue rounded-lg px-4 py-2 min-w-[120px] z-20"
-                    style={{
-                      boxShadow: '0 0 20px rgba(0, 212, 255, 0.5)',
-                    }}
-                  >
-                    <div className="text-center">
-                      <p className="text-cyber-blue text-xs mb-1">
-                        {city.type === 'industrial' ? '🏭 산업지역' : 
-                         city.type === 'tech' ? '💡 기술지역' : 
-                         city.type === 'renewable' ? '🌊 신재생' :
-                         city.type === 'network' ? '🔗 네트워크' : '🏘️ 주거지역'}
-                      </p>
-                      <p className="text-cyber-gold text-xs font-bold">
-                        {isPowered ? '⚡ 전력공급중' : '● 대기중'}
-                      </p>
-                    </div>
-                    {/* 툴팁 화살표 */}
-                    <div 
-                      className="absolute left-1/2 -translate-x-1/2 top-full w-0 h-0"
-                      style={{
-                        borderLeft: '6px solid transparent',
-                        borderRight: '6px solid transparent',
-                        borderTop: '6px solid #00d4ff',
-                      }}
-                    />
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </motion.div>
-          );
-        })}
-                      width="100"
-                      height="40"
-                      rx="8"
-                      fill="#0a0e27"
-                      stroke="#00d4ff"
-                      strokeWidth="2"
-                    />
-                    <text
-                      x={city.x}
-                      y={city.y + 45}
-                      textAnchor="middle"
-                      fill="#00d4ff"
-                      fontSize="12"
-                    >
-                      {city.type === 'industrial' ? '산업' : city.type === 'tech' ? '기술' : '주거'}
-                    </text>
-                    <text
-                      x={city.x}
-                      y={city.y + 58}
-                      textAnchor="middle"
-                      fill="#ffd700"
-                      fontSize="10"
-                    >
-                      {isPowered ? '⚡ 전력공급' : '● 대기중'}
-                    </text>
-                  </motion.g>
-                )}
-              </AnimatePresence>
-            </g>
-          );
-        })}
-
-
-        {/* 수요지 (마을/산업단지) - 실제 지도 위 절대 좌표 배치 */}
-        {gameState.demandPoints.map((point, index) => {
-          const isPowered = point.power > 0;
-          const Icon = point.type === 'village' ? Home : Factory;
-
-          return (
+        return (
+          <motion.div
+            key={index}
+            className="absolute"
+            style={{
+              left: `${leftPercent}%`,
+              top: `${topPercent}%`,
+              transform: 'translate(-50%, -50%)',
+            }}
+            whileHover={{ scale: 1.15 }}
+          >
             <motion.div
-              key={point.id}
-              className="absolute"
-              style={{
-                // 퍼센트 기반 절대 좌표
-                left: `${(point.x / 800) * 100}%`,
-                top: `${(point.y / 600) * 100}%`,
-                transform: 'translate(-50%, -50%)',
-              }}
-              initial={{ opacity: 0, scale: 0 }}
-              animate={{ opacity: 1, scale: 1 }}
-              transition={{ delay: 0.5 + index * 0.1 }}
+              className={`p-2 rounded-lg border-2 ${
+                isPowered
+                  ? 'bg-green-900 bg-opacity-80 border-green-400'
+                  : 'bg-red-900 bg-opacity-80 border-red-400'
+              }`}
+              animate={isPowered ? {
+                boxShadow: [
+                  '0 0 10px rgba(74, 222, 128, 0.5)',
+                  '0 0 20px rgba(74, 222, 128, 0.8)',
+                  '0 0 10px rgba(74, 222, 128, 0.5)',
+                ],
+              } : {}}
+              transition={{ duration: 1.5, repeat: Infinity }}
             >
-              {/* 전력 공급 시 글로우 효과 */}
-              {isPowered && (
-                <motion.div
-                  className="absolute inset-0 rounded-full blur-lg"
-                  style={{
-                    width: '40px',
-                    height: '40px',
-                    background: point.type === 'village' 
-                      ? 'radial-gradient(circle, #ffd70080, transparent)' 
-                      : 'radial-gradient(circle, #ff336680, transparent)',
-                    transform: 'translate(-50%, -50%)',
-                    left: '50%',
-                    top: '50%',
-                  }}
-                  animate={{
-                    scale: [1, 1.4, 1],
-                    opacity: [0.6, 1, 0.6],
-                  }}
-                  transition={{ duration: 2, repeat: Infinity, delay: index * 0.2 }}
-                />
-              )}
-
-              {/* 수요지 아이콘 */}
-              <div
-                className={`
-                  relative z-10 w-8 h-8 rounded-full border-2 flex items-center justify-center
-                  ${isPowered 
-                    ? (point.type === 'village' ? 'bg-cyber-gold border-yellow-400' : 'bg-cyber-red border-red-400')
-                    : 'bg-gray-800 border-gray-600'
-                  }
-                `}
-                style={{
-                  boxShadow: isPowered 
-                    ? `0 0 15px ${point.type === 'village' ? '#ffd700' : '#ff3366'}80`
-                    : 'none',
-                }}
-              >
-                <Icon className="w-4 h-4" color={isPowered ? '#fff' : '#555'} />
-              </div>
-
-              {/* 수요지 이름 */}
-              <div 
-                className="absolute top-full mt-1 text-xs whitespace-nowrap font-semibold"
-                style={{
-                  left: '50%',
-                  transform: 'translateX(-50%)',
-                  color: isPowered 
-                    ? (point.type === 'village' ? '#ffd700' : '#ff3366')
-                    : '#666',
-                  textShadow: isPowered ? '0 0 8px rgba(0, 0, 0, 0.8)' : 'none',
-                }}
-              >
-                {point.name}
-              </div>
+              <Icon className={`w-4 h-4 ${isPowered ? 'text-green-300' : 'text-red-300'}`} />
             </motion.div>
-          );
-        })}
-
-        {/* 건물 연결선 (송전선로) - SVG 레이어 */}
-        <svg className="absolute inset-0 w-full h-full pointer-events-none">
-          {gameState.connections.map((conn) => {
-            const fromBuilding = gameState.buildings.find(b => b.id === conn.from);
-            const toBuilding = gameState.buildings.find(b => b.id === conn.to);
             
-            if (!fromBuilding?.position || !toBuilding?.position) return null;
+            <div className="absolute top-10 left-1/2 transform -translate-x-1/2 text-center whitespace-nowrap">
+              {/* 수정: name과 demand가 유효한 값인지 확인 */}
+              <div className="text-xs font-bold text-white bg-black bg-opacity-70 px-2 py-1 rounded">
+                {String(point?.name || '수요지')}
+              </div>
+              <div className="text-xs text-gray-400 bg-black bg-opacity-70 px-2 py-1 rounded mt-1">
+                수요: {typeof point?.demand === 'number' ? point.demand.toFixed(0) : '0'}kW
+              </div>
+            </div>
+          </motion.div>
+        );
+      })}
 
-            const isHVDC = conn.type === 'hvdc';
-            
-            // 퍼센트 좌표를 픽셀로 변환
-            const x1 = (fromBuilding.position.x / 800) * 100;
-            const y1 = (fromBuilding.position.y / 600) * 100;
-            const x2 = (toBuilding.position.x / 800) * 100;
-            const y2 = (toBuilding.position.y / 600) * 100;
+      {(gameState?.connections || []).map((conn, index) => {
+        const from = gameState?.buildings?.find(b => b.id === conn.from);
+        const to = gameState?.buildings?.find(b => b.id === conn.to);
+        
+        if (!from || !to) return null;
 
-            return (
-              <motion.line
-                key={conn.id}
-                x1={`${x1}%`}
-                y1={`${y1}%`}
-                x2={`${x2}%`}
-                y2={`${y2}%`}
-                stroke={isHVDC ? '#00d4ff' : '#ff6b6b'}
-                strokeWidth={isHVDC ? "4" : "3"}
-                strokeDasharray={isHVDC ? "0" : "8,4"}
-                initial={{ pathLength: 0, opacity: 0 }}
-                animate={{ pathLength: 1, opacity: 0.8 }}
-                transition={{ duration: 1.5 }}
-                style={{
-                  filter: isHVDC 
-                    ? 'drop-shadow(0 0 8px #00d4ff)' 
-                    : 'drop-shadow(0 0 6px #ff6b6b)',
-                }}
-              />
-            );
-          })}
-        </svg>
-      </div>
+        const fromLeftPercent = (from.x / 800) * 100;
+        const fromTopPercent = (from.y / 600) * 100;
+        const toLeftPercent = (to.x / 800) * 100;
+        const toTopPercent = (to.y / 600) * 100;
 
-      {/* 맵 범례 - 실제 지도 위 오버레이 */}
+        return (
+          <svg 
+            key={index}
+            className="absolute inset-0 w-full h-full pointer-events-none"
+            style={{ zIndex: 1 }}
+          >
+            <motion.line
+              x1={`${fromLeftPercent}%`}
+              y1={`${fromTopPercent}%`}
+              x2={`${toLeftPercent}%`}
+              y2={`${toTopPercent}%`}
+              stroke={conn.isPowered ? '#00d4ff' : '#4b5563'}
+              strokeWidth="2"
+              strokeDasharray="5,5"
+              initial={{ pathLength: 0 }}
+              animate={{ 
+                pathLength: 1,
+                strokeOpacity: conn.isPowered ? [0.5, 1, 0.5] : 0.3,
+              }}
+              transition={{ 
+                pathLength: { duration: 0.5 },
+                strokeOpacity: { duration: 2, repeat: Infinity },
+              }}
+            />
+          </svg>
+        );
+      })}
+
+      {(gameState?.buildings || []).map((building) => {
+        const leftPercent = (building.x / 800) * 100;
+        const topPercent = (building.y / 600) * 100;
+
+        return (
+          <motion.div
+            key={building.id}
+            className="absolute"
+            style={{
+              left: `${leftPercent}%`,
+              top: `${topPercent}%`,
+              transform: 'translate(-50%, -50%)',
+              zIndex: 5,
+            }}
+            initial={{ scale: 0, rotate: -180 }}
+            animate={{ scale: 1, rotate: 0 }}
+            whileHover={{ scale: 1.2 }}
+          >
+            <div className={`p-3 rounded-lg border-2 ${
+              building.isPowered
+                ? 'bg-cyber-blue bg-opacity-20 border-cyber-blue'
+                : 'bg-gray-700 bg-opacity-50 border-gray-500'
+            }`}>
+              <Zap className={`w-5 h-5 ${
+                building.isPowered ? 'text-cyber-blue' : 'text-gray-500'
+              }`} />
+            </div>
+            <div className="absolute top-12 left-1/2 transform -translate-x-1/2 text-center whitespace-nowrap">
+              {/* 수정: type과 output이 문자열/숫자인지 확인 후 렌더링 */}
+              <div className="text-xs font-bold text-cyber-blue bg-black bg-opacity-70 px-2 py-1 rounded">
+                {String(building?.type || '건물')}
+              </div>
+              <div className="text-xs text-yellow-400 bg-black bg-opacity-70 px-2 py-1 rounded mt-1">
+                {typeof building?.output === 'number' ? building.output : 0}kW
+              </div>
+            </div>
+          </motion.div>
+        );
+      })}
+
       <div className="absolute bottom-4 left-4 bg-cyber-dark bg-opacity-95 rounded-lg p-4 border-2 border-cyber-blue z-10 backdrop-blur-sm">
         <h3 className="text-sm font-bold text-cyber-blue mb-3 flex items-center gap-2">
           <Zap className="w-4 h-4" />
@@ -349,29 +261,35 @@ const GyeongnamMap = ({ selectedRegion, gameState, onCityClick }) => {
         </h3>
         <div className="space-y-2 text-xs text-gray-300">
           <div className="flex items-center gap-2">
-            <div className="w-4 h-4 rounded-full bg-cyber-blue border-2 border-white shadow-lg"></div>
-            <span>주요 도시 노드</span>
+            <div className="w-3 h-3 rounded-full bg-cyber-blue border border-cyber-blue"></div>
+            <span>전력공급 도시</span>
           </div>
           <div className="flex items-center gap-2">
-            <div className="w-4 h-4 rounded-full bg-cyber-gold border-2 border-yellow-400 shadow-lg"></div>
-            <span>마을 (저압수요)</span>
+            <div className="w-3 h-3 rounded-full bg-gray-700 border border-gray-500"></div>
+            <span>대기중 도시</span>
           </div>
           <div className="flex items-center gap-2">
-            <div className="w-4 h-4 rounded-full bg-cyber-red border-2 border-red-400 shadow-lg"></div>
-            <span>산업단지 (고압수요)</span>
-          </div>
-          <div className="flex items-center gap-2 pt-2 border-t border-gray-700">
-            <div className="w-8 h-1 bg-cyber-blue rounded shadow-lg"></div>
-            <span>HVDC 송전선 (손실 0%)</span>
+            <Home className="w-3 h-3 text-green-400" />
+            <span>마을 (수요지)</span>
           </div>
           <div className="flex items-center gap-2">
-            <div className="w-8 h-1 bg-cyber-red rounded shadow-lg" style={{ 
-              background: 'repeating-linear-gradient(90deg, #ff6b6b 0, #ff6b6b 6px, transparent 6px, transparent 10px)'
-            }}></div>
-            <span>AC 송전선 (손실 발생)</span>
+            <Factory className="w-3 h-3 text-green-400" />
+            <span>산업단지 (수요지)</span>
           </div>
         </div>
       </div>
+
+      {regionData && (
+        <div className="absolute top-4 right-4 bg-cyber-dark bg-opacity-95 rounded-lg p-3 border-2 border-cyber-purple z-10 backdrop-blur-sm">
+          <div className="text-sm font-bold text-cyber-purple mb-1">{regionData.name}</div>
+          <div className="text-xs text-gray-400">{regionData.description}</div>
+          <div className="mt-2 text-xs">
+            <span className="text-yellow-400">버프: </span>
+            {/* 수정: buff 객체가 아닌 buff.label 문자열만 렌더링 */}
+            <span className="text-green-400">{regionData.buff?.label || '없음'}</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

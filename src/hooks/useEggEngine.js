@@ -14,6 +14,7 @@ export const useEggEngine = (selectedRegion) => {
     return {
       buildings: [],
       connections: [],
+      cities: [],
       demandPoints: DEMAND_POINTS.map(p => ({ ...p })),
       starterPackUsed: false,
       phase: 'initial', // initial, building, operational
