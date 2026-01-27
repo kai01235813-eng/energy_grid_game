@@ -78,13 +78,7 @@ function App() {
 
   return (
     <div className="w-screen h-screen bg-cyber-darker relative overflow-hidden">
-      {/* 배경 애니메이션 그리드 */}
-      <div className="absolute inset-0 opacity-10 pointer-events-none">
-        <div className="w-full h-full" style={{
-          backgroundImage: 'linear-gradient(#00d4ff 1px, transparent 1px), linear-gradient(90deg, #00d4ff 1px, transparent 1px)',
-          backgroundSize: '50px 50px',
-        }} />
-      </div>
+      {/* 배경 그리드 제거 - 실제 지도 이미지가 메인 캔버스 역할 */}
 
       {/* 경제 패널 */}
       <EconomyPanel 
