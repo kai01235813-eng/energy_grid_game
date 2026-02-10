@@ -9,7 +9,8 @@ import EconomyPanel from './components/EconomyPanel';
 import GridReconnectedEffect from './components/GridReconnectedEffect';
 import DevPanel from './components/DevPanel';
 import DisasterResponseSystem from './components/DisasterResponseSystem';
-import { Power, Zap, Shield } from 'lucide-react';
+import EnergyGenesis from './components/EnergyGenesis';
+import { Power, Zap, Shield, Sparkles } from 'lucide-react';
 
 function App() {
   const { user, convertExpToCoins, spendCoins, selectRegion, gainExp } = useEggUser();
@@ -24,7 +25,7 @@ function App() {
 
   const [showReconnectedEffect, setShowReconnectedEffect] = useState(false);
   const [buildingMode, setBuildingMode] = useState(null); // 현재 배치 중인 건물
-  const [gameMode, setGameMode] = useState('grid'); // 'grid' 또는 'disaster'
+  const [gameMode, setGameMode] = useState('genesis'); // 'grid', 'disaster', 'genesis'
 
   // 지역 선택 핸들러
   const handleRegionSelect = (regionId) => {
@@ -84,6 +85,23 @@ function App() {
     }
   }, [gameState.buildings, gameState.starterPackUsed, buildingMode]);
 
+  // Energy Genesis 모드 (새 게임)
+  if (gameMode === 'genesis') {
+    return (
+      <div className="relative w-screen h-screen">
+        {/* 기존 게임 모드로 전환 버튼 */}
+        <button
+          onClick={() => setGameMode('grid')}
+          className="absolute top-4 left-4 z-50 bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white px-4 py-2 rounded-lg flex items-center gap-2 transition-colors shadow-lg"
+        >
+          <Zap className="w-5 h-5" />
+          기존 에그 게임
+        </button>
+        <EnergyGenesis />
+      </div>
+    );
+  }
+
   // 지역 선택이 안 된 경우
   if (!user.selectedRegion) {
     return <RegionSelection onSelectRegion={handleRegionSelect} />;
@@ -96,13 +114,22 @@ function App() {
     return (
       <div className="w-screen h-screen bg-cyber-darker relative">
         {/* 모드 전환 버튼 */}
-        <button
-          onClick={() => setGameMode('grid')}
-          className="absolute top-4 left-4 z-50 bg-cyber-blue hover:bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center gap-2 transition-colors"
-        >
-          <Zap className="w-5 h-5" />
-          그리드 건설 모드로 전환
-        </button>
+        <div className="absolute top-4 left-4 z-50 flex gap-2">
+          <button
+            onClick={() => setGameMode('grid')}
+            className="bg-cyber-blue hover:bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center gap-2 transition-colors"
+          >
+            <Zap className="w-5 h-5" />
+            그리드 건설
+          </button>
+          <button
+            onClick={() => setGameMode('genesis')}
+            className="bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 text-white px-4 py-2 rounded-lg flex items-center gap-2 transition-colors"
+          >
+            <Sparkles className="w-5 h-5" />
+            Energy Genesis
+          </button>
+        </div>
         <DisasterResponseSystem gameState={gameState} />
       </div>
     );
@@ -113,14 +140,24 @@ function App() {
       {/* 배경 그리드 제거 - 실제 지도 이미지가 메인 캔버스 역할 */}
 
       {/* 모드 전환 버튼 */}
-      <button
-        onClick={() => setGameMode('disaster')}
-        className="absolute top-4 left-1/2 -translate-x-1/2 z-30 bg-red-900 hover:bg-red-800 border-2 border-red-500 text-white px-6 py-3 rounded-lg flex items-center gap-2 transition-colors shadow-lg"
-        style={{ boxShadow: '0 0 20px rgba(239, 68, 68, 0.5)' }}
-      >
-        <Shield className="w-5 h-5" />
-        AI 재난대응 시스템 진입
-      </button>
+      <div className="absolute top-4 left-1/2 -translate-x-1/2 z-30 flex gap-2">
+        <button
+          onClick={() => setGameMode('disaster')}
+          className="bg-red-900 hover:bg-red-800 border-2 border-red-500 text-white px-6 py-3 rounded-lg flex items-center gap-2 transition-colors shadow-lg"
+          style={{ boxShadow: '0 0 20px rgba(239, 68, 68, 0.5)' }}
+        >
+          <Shield className="w-5 h-5" />
+          AI 재난대응
+        </button>
+        <button
+          onClick={() => setGameMode('genesis')}
+          className="bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 border-2 border-purple-400 text-white px-6 py-3 rounded-lg flex items-center gap-2 transition-colors shadow-lg"
+          style={{ boxShadow: '0 0 20px rgba(168, 85, 247, 0.5)' }}
+        >
+          <Sparkles className="w-5 h-5" />
+          Energy Genesis
+        </button>
+      </div>
 
       {/* 경제 패널 */}
       <EconomyPanel 
