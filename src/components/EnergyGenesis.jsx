@@ -6,6 +6,8 @@ import {
   Flame, Wind, Sun, Battery, Brain, Eye, FileText, Sparkles, Book
 } from 'lucide-react';
 import GameManual from './GameManual';
+import Tutorial from './Tutorial';
+import DebugPanel from './DebugPanel';
 
 // 시대 정의
 const ERAS = {
@@ -218,7 +220,9 @@ const EnergyGenesis = () => {
   const [powerLines, setPowerLines] = useState([]);
   const [unlockedTechs, setUnlockedTechs] = useState([]);
   const [showTechTree, setShowTechTree] = useState(false);
-  const [showManual, setShowManual] = useState(true); // 게임 매뉴얼 표시
+  const [showManual, setShowManual] = useState(false);
+  const [showTutorial, setShowTutorial] = useState(true); // 튜토리얼 표시
+  const [showDebugInfo, setShowDebugInfo] = useState(false); // 디버그 정보 표시
   const [totalPowerOutput, setTotalPowerOutput] = useState(0);
   const [poweredCities, setPoweredCities] = useState([]);
   const [gameLog, setGameLog] = useState([]);
@@ -270,71 +274,81 @@ const EnergyGenesis = () => {
 
   // 변전소 자동 연결 (가장 가까운 송전탑과 연결)
   const autoConnectSubstation = useCallback((substation) => {
-    const towers = buildings.filter(b => b.type === 'tower');
-    const generators = buildings.filter(b => b.type === 'generator');
+    // 최신 buildings 상태를 직접 받아옴
+    setBuildings(currentBuildings => {
+      const towers = currentBuildings.filter(b => b.type === 'tower');
+      const generators = currentBuildings.filter(b => b.type === 'generator');
 
-    if (towers.length === 0) {
-      addLog('연결 가능한 송전탑이 없습니다!', 'warning');
-      return;
-    }
-
-    const newLines = [];
-
-    // 가장 가까운 송전탑 찾기
-    let nearestTower = null;
-    let minDistance = Infinity;
-
-    towers.forEach(tower => {
-      const distance = Math.sqrt(
-        Math.pow(tower.x - substation.x, 2) + 
-        Math.pow(tower.y - substation.y, 2)
-      );
-
-      if (distance <= tower.range && distance < minDistance) {
-        minDistance = distance;
-        nearestTower = tower;
+      if (towers.length === 0) {
+        addLog('연결 가능한 송전탑이 없습니다! 먼저 송전탑을 건설하세요.', 'warning');
+        return currentBuildings;
       }
-    });
 
-    if (nearestTower) {
-      newLines.push({
-        id: `line-${Date.now()}-1`,
-        from: nearestTower.id,
-        to: substation.id,
-        fromX: nearestTower.x,
-        fromY: nearestTower.y,
-        toX: substation.x,
-        toY: substation.y,
-        active: true
+      const newLines = [];
+
+      // 가장 가까운 송전탑 찾기
+      let nearestTower = null;
+      let minDistance = Infinity;
+
+      towers.forEach(tower => {
+        const distance = Math.sqrt(
+          Math.pow(tower.x - substation.x, 2) + 
+          Math.pow(tower.y - substation.y, 2)
+        );
+
+        if (distance <= tower.range && distance < minDistance) {
+          minDistance = distance;
+          nearestTower = tower;
+        }
       });
-      addLog(`${substation.name} ↔ 송전탑 연결 완료`, 'success');
-    }
 
-    // 송전탑과 발전기 연결
-    generators.forEach(gen => {
-      const distance = Math.sqrt(
-        Math.pow(gen.x - (nearestTower?.x || 0), 2) + 
-        Math.pow(gen.y - (nearestTower?.y || 0), 2)
-      );
-
-      if (nearestTower && distance <= nearestTower.range) {
+      if (nearestTower) {
         newLines.push({
-          id: `line-${Date.now()}-${gen.id}`,
-          from: gen.id,
-          to: nearestTower.id,
-          fromX: gen.x,
-          fromY: gen.y,
-          toX: nearestTower.x,
-          toY: nearestTower.y,
+          id: `line-${Date.now()}-1`,
+          from: nearestTower.id,
+          to: substation.id,
+          fromX: nearestTower.x,
+          fromY: nearestTower.y,
+          toX: substation.x,
+          toY: substation.y,
           active: true
         });
+        addLog(`${substation.name} ↔ 송전탑 연결 완료!`, 'success');
+      } else {
+        addLog('범위 내에 송전탑이 없습니다! (범위: 150m)', 'warning');
       }
-    });
 
-    if (newLines.length > 0) {
-      setPowerLines(prev => [...prev, ...newLines]);
-    }
-  }, [buildings, addLog]);
+      // 송전탑과 발전기 연결
+      generators.forEach(gen => {
+        const distance = Math.sqrt(
+          Math.pow(gen.x - (nearestTower?.x || 0), 2) + 
+          Math.pow(gen.y - (nearestTower?.y || 0), 2)
+        );
+
+        if (nearestTower && distance <= nearestTower.range) {
+          newLines.push({
+            id: `line-${Date.now()}-${gen.id}`,
+            from: gen.id,
+            to: nearestTower.id,
+            fromX: gen.x,
+            fromY: gen.y,
+            toX: nearestTower.x,
+            toY: nearestTower.y,
+            active: true
+          });
+        }
+      });
+
+      if (newLines.length > 0) {
+        setPowerLines(prev => [...prev, ...newLines]);
+        if (newLines.length > 1) {
+          addLog(`${newLines.length}개의 전력선 연결 완료!`, 'success');
+        }
+      }
+
+      return currentBuildings;
+    });
+  }, [addLog]);
 
   // 전력 공급 계산
   useEffect(() => {
@@ -630,6 +644,22 @@ const EnergyGenesis = () => {
                 } : {}}
                 transition={isFailed ? { duration: 0.5, repeat: Infinity } : {}}
               >
+                {/* 디버그: 범위 표시 (송전탑과 변전소만) */}
+                {showDebugInfo && (building.type === 'tower' || building.type === 'substation') && (
+                  <div
+                    className="absolute rounded-full border-2 border-dashed opacity-30 pointer-events-none"
+                    style={{
+                      width: `${building.range * 2 || 300}px`,
+                      height: `${building.range * 2 || 300}px`,
+                      left: '50%',
+                      top: '50%',
+                      transform: 'translate(-50%, -50%)',
+                      borderColor: building.type === 'tower' ? '#3b82f6' : '#10b981',
+                      backgroundColor: building.type === 'tower' ? 'rgba(59, 130, 246, 0.1)' : 'rgba(16, 185, 129, 0.1)'
+                    }}
+                  />
+                )}
+                
                 <div 
                   className="text-5xl"
                   style={{
@@ -902,6 +932,51 @@ const EnergyGenesis = () => {
           <GameManual onClose={() => setShowManual(false)} />
         )}
       </AnimatePresence>
+
+      {/* 튜토리얼 */}
+      <AnimatePresence>
+        {showTutorial && (
+          <Tutorial 
+            onComplete={() => setShowTutorial(false)}
+            onSkip={() => setShowTutorial(false)}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* 디버그 패널 */}
+      <DebugPanel
+        gameState={{
+          buildings,
+          powerLines,
+          poweredCities,
+          currentEra,
+          budget,
+          techPoints
+        }}
+        onAddMoney={(amount) => setBudget(prev => prev + amount)}
+        onAddTechPoints={(amount) => setTechPoints(prev => prev + amount)}
+        onResetGame={() => {
+          setBudget(500);
+          setTechPoints(0);
+          setBuildings([]);
+          setPowerLines([]);
+          setPoweredCities([]);
+          setUnlockedTechs([]);
+          setCurrentEra(ERAS.DAWN);
+          setGameLog([]);
+          setFailedBuildings([]);
+          setSelectedBuildingType(null);
+          addLog('게임이 초기화되었습니다.', 'info');
+        }}
+        onClearBuildings={() => {
+          setBuildings([]);
+          setPowerLines([]);
+          setPoweredCities([]);
+          addLog('모든 건물이 제거되었습니다.', 'warning');
+        }}
+        onToggleDebugInfo={() => setShowDebugInfo(!showDebugInfo)}
+        showDebugInfo={showDebugInfo}
+      />
     </div>
   );
 };
