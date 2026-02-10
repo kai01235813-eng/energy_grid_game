@@ -3,8 +3,9 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { 
   Zap, Factory, Radio, Building2, TrendingUp, Shield,
   AlertTriangle, DollarSign, Award, ChevronRight, Power,
-  Flame, Wind, Sun, Battery, Brain, Eye, FileText, Sparkles
+  Flame, Wind, Sun, Battery, Brain, Eye, FileText, Sparkles, Book
 } from 'lucide-react';
+import GameManual from './GameManual';
 
 // 시대 정의
 const ERAS = {
@@ -217,6 +218,7 @@ const EnergyGenesis = () => {
   const [powerLines, setPowerLines] = useState([]);
   const [unlockedTechs, setUnlockedTechs] = useState([]);
   const [showTechTree, setShowTechTree] = useState(false);
+  const [showManual, setShowManual] = useState(true); // 게임 매뉴얼 표시
   const [totalPowerOutput, setTotalPowerOutput] = useState(0);
   const [poweredCities, setPoweredCities] = useState([]);
   const [gameLog, setGameLog] = useState([]);
@@ -519,13 +521,22 @@ const EnergyGenesis = () => {
           )}
 
           {/* 기술 트리 버튼 */}
-          <button
-            onClick={() => setShowTechTree(!showTechTree)}
-            className="bg-gradient-to-r from-cyan-600 to-blue-600 px-4 py-2 rounded-lg flex items-center gap-2"
-          >
-            <Brain className="w-5 h-5" />
-            기술 연구
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={() => setShowTechTree(!showTechTree)}
+              className="bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 px-4 py-2 rounded-lg flex items-center gap-2 transition-colors"
+            >
+              <Brain className="w-5 h-5" />
+              기술 연구
+            </button>
+            <button
+              onClick={() => setShowManual(true)}
+              className="bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-500 hover:to-emerald-500 px-4 py-2 rounded-lg flex items-center gap-2 transition-colors"
+            >
+              <Book className="w-5 h-5" />
+              게임 매뉴얼
+            </button>
+          </div>
         </div>
       </div>
 
@@ -882,6 +893,13 @@ const EnergyGenesis = () => {
               </button>
             </motion.div>
           </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* 게임 매뉴얼 */}
+      <AnimatePresence>
+        {showManual && (
+          <GameManual onClose={() => setShowManual(false)} />
         )}
       </AnimatePresence>
     </div>
