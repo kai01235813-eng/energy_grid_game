@@ -8,7 +8,8 @@ import StarterPackUI from './components/StarterPackUI';
 import EconomyPanel from './components/EconomyPanel';
 import GridReconnectedEffect from './components/GridReconnectedEffect';
 import DevPanel from './components/DevPanel';
-import { Power, Zap } from 'lucide-react';
+import DisasterResponseSystem from './components/DisasterResponseSystem';
+import { Power, Zap, Shield } from 'lucide-react';
 
 function App() {
   const { user, convertExpToCoins, spendCoins, selectRegion, gainExp } = useEggUser();
@@ -23,6 +24,7 @@ function App() {
 
   const [showReconnectedEffect, setShowReconnectedEffect] = useState(false);
   const [buildingMode, setBuildingMode] = useState(null); // 현재 배치 중인 건물
+  const [gameMode, setGameMode] = useState('grid'); // 'grid' 또는 'disaster'
 
   // 지역 선택 핸들러
   const handleRegionSelect = (regionId) => {
@@ -89,9 +91,36 @@ function App() {
 
   const allBuildingsPlaced = gameState.buildings.length > 0 && gameState.buildings.every(b => b.placed);
 
+  // 재난대응 모드인 경우
+  if (gameMode === 'disaster') {
+    return (
+      <div className="w-screen h-screen bg-cyber-darker relative">
+        {/* 모드 전환 버튼 */}
+        <button
+          onClick={() => setGameMode('grid')}
+          className="absolute top-4 left-4 z-50 bg-cyber-blue hover:bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center gap-2 transition-colors"
+        >
+          <Zap className="w-5 h-5" />
+          그리드 건설 모드로 전환
+        </button>
+        <DisasterResponseSystem gameState={gameState} />
+      </div>
+    );
+  }
+
   return (
     <div className="w-screen h-screen bg-cyber-darker relative overflow-hidden">
       {/* 배경 그리드 제거 - 실제 지도 이미지가 메인 캔버스 역할 */}
+
+      {/* 모드 전환 버튼 */}
+      <button
+        onClick={() => setGameMode('disaster')}
+        className="absolute top-4 left-1/2 -translate-x-1/2 z-30 bg-red-900 hover:bg-red-800 border-2 border-red-500 text-white px-6 py-3 rounded-lg flex items-center gap-2 transition-colors shadow-lg"
+        style={{ boxShadow: '0 0 20px rgba(239, 68, 68, 0.5)' }}
+      >
+        <Shield className="w-5 h-5" />
+        AI 재난대응 시스템 진입
+      </button>
 
       {/* 경제 패널 */}
       <EconomyPanel 
