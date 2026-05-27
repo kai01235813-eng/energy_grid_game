@@ -1735,25 +1735,60 @@ function RelocationTargets({ relocationMode, buildings, terrainByKey, onPick }) 
 }
 
 function PulsingTargetHalo({ position, onPick }) {
-  const ref = useRef();
+  const ringRef = useRef();
+  const beamRef = useRef();
+  // Visibility on mobile was poor — thin ring at y=0.05 with min-opacity
+  // 0.45 was getting z-fought / aliased into invisibility on DPR≈1.5
+  // displays. Fixes: raise off ground, disable depthWrite so it sits on
+  // top of any hex/terrain mesh, fatter ring + smoother segments, much
+  // higher base opacity, and add a tall vertical beam so the marker is
+  // unmistakable even at very oblique mobile camera angles.
   useFrame(({ clock }) => {
-    if (!ref.current) return;
-    const phase = Math.sin(clock.elapsedTime * 3.0) * 0.5 + 0.5;
-    ref.current.scale.setScalar(0.85 + phase * 0.2);
-    ref.current.material.opacity = 0.45 + phase * 0.35;
+    const t = clock.elapsedTime;
+    if (ringRef.current) {
+      const phase = Math.sin(t * 2.6) * 0.5 + 0.5;
+      ringRef.current.scale.setScalar(0.9 + phase * 0.12);
+      ringRef.current.material.opacity = 0.7 + phase * 0.25;
+    }
+    if (beamRef.current) {
+      beamRef.current.position.y = 0.5 + Math.sin(t * 1.8) * 0.08;
+    }
   });
   return (
-    <mesh
-      ref={ref}
-      position={position}
-      rotation={[-Math.PI / 2, 0, 0]}
+    <group
+      position={[position[0], position[1], position[2]]}
       onClick={(e) => { e.stopPropagation(); onPick(); }}
       onPointerOver={(e) => { e.stopPropagation(); document.body.style.cursor = 'pointer'; }}
       onPointerOut={(e) => { e.stopPropagation(); document.body.style.cursor = ''; }}
     >
-      <ringGeometry args={[HEX_R * 0.7, HEX_R * 0.92, 6]} />
-      <meshBasicMaterial color="#9affc8" transparent opacity={0.6} />
-    </mesh>
+      {/* ground ring — bright green, draws on top of hex/terrain */}
+      <mesh ref={ringRef} position={[0, 0.18, 0]} rotation={[-Math.PI / 2, 0, 0]} renderOrder={2}>
+        <ringGeometry args={[HEX_R * 0.55, HEX_R * 0.92, 22]} />
+        <meshBasicMaterial
+          color="#9affc8"
+          transparent
+          opacity={0.85}
+          depthWrite={false}
+          side={THREE.DoubleSide}
+        />
+      </mesh>
+      {/* vertical beam — visible from any camera angle, including low
+          oblique angles common on mobile */}
+      <mesh ref={beamRef} position={[0, 0.5, 0]} renderOrder={2}>
+        <cylinderGeometry args={[0.10, 0.18, 0.95, 10]} />
+        <meshBasicMaterial
+          color="#9affc8"
+          transparent
+          opacity={0.55}
+          depthWrite={false}
+        />
+      </mesh>
+      {/* invisible larger click hitbox for fat-finger taps on mobile */}
+      <mesh position={[0, 0.4, 0]} visible={false}>
+        <cylinderGeometry args={[HEX_R * 0.6, HEX_R * 0.6, 0.9, 6]} />
+        <meshBasicMaterial transparent opacity={0} />
+      </mesh>
+    </group>
   );
 }
 
@@ -3263,6 +3298,20 @@ function operatingAdvice({ freq, money, faults, workers, buildings, powered, cou
   const dev = Math.abs(freq - NOMINAL_FREQ);
   const high = freq > NOMINAL_FREQ;
 
+  // Topology issue — load exists but isn't reaching the grid. Surfaces
+  // ABOVE freq warnings because the right advice is "connect it", not
+  // "build more / remove a plant". This explains the "왜 수요를 계속
+  // 짓는데도 주파수가 안 떨어지지?" symptom — new consumers aren't yet
+  // wired into the powered network so they don't register as demand.
+  if (strandedDemand && strandedDemand >= 20) {
+    return {
+      level: 'urgent',
+      icon: '🔌',
+      title: `${strandedDemand} MW 소비처가 그리드에서 끊김`,
+      body: '가정/마을/공장을 더 지어도 변전소·전신주 체인까지 이어지지 않으면 부하로 잡히지 않아 주파수가 안 떨어집니다. 발전소 → 송전탑 → 변전소 → 전신주 → 가정 순서로 회선이 모두 연결됐는지 확인하세요.',
+    };
+  }
+
   // BLACKOUT zone — immediate threat to the run
   if (dev > 1.0) {
     return high
@@ -3594,11 +3643,51 @@ const INTERACTIVE_STEPS = [
     requiresVillage: true,
     highlight: 'solar',
   },
+  {
+    icon: '🧠',
+    title: '스마트그리드 — 주파수 자동 안정화',
+    body: (
+      '실생활 발전기는 부하 변동에 즉시 따라가지 못해 주파수가 출렁입니다. 스마트그리드 설비가 이걸 자동으로 잡아 줍니다.<br/><br/>'
+      + '<b>① 태양광·풍력 (출력제어 / curtailment)</b><br/>'
+      + '공급이 수요를 초과하면 인버터가 출력을 스스로 깎습니다. 신재생을 잔뜩 지어도 주파수가 위로 폭주하지 않는 이유입니다.<br/><br/>'
+      + '<b>② ESS (자동 충·방전)</b><br/>'
+      + '• 주파수 <b>60 Hz 위로 상승 → 충전</b> (잉여 흡수)<br/>'
+      + '• 주파수 <b>60 Hz 아래로 하강 → 방전</b> (부족 보충)<br/>'
+      + '변전소·전신주·데이터센터 옆에 두면 자동 작동합니다.<br/><br/>'
+      + '<b>실전 팁</b>: 사고·날씨 변동에 강한 그리드를 원한다면 <b>신재생 + ESS 조합</b>이 핵심. 콤보 보너스 유지에도 결정적.'
+    ),
+    info: true,
+  },
+  {
+    icon: '🚨',
+    title: '사고 대응 — 항목별 조치',
+    body: (
+      '플레이 중 다양한 사고 이벤트가 발생합니다. 각각 대응 방법이 다릅니다.<br/><br/>'
+      + '<b>🐦 까마귀 트립 (송전탑·전신주)</b><br/>'
+      + '해당 설비를 직접 <b>탭</b>해서 쫓아내세요. 9초 방치 시 자동 dismiss.<br/><br/>'
+      + '<b>🔥 산불 (송전탑)</b><br/>'
+      + '불타는 송전탑을 <b>탭</b>해 진화 헬기 투입. 방치 시 15초 후 자연 진화되지만 그동안 정전 + 사고 처리비 −₩300.<br/><br/>'
+      + '<b>⚡ 낙뢰 (송전탑)</b><br/>'
+      + '3초 후 자동 회복. 즉시 사고 처리비 −₩350만 차감 (클릭 불필요).<br/><br/>'
+      + '<b>🔧 선로 고장 · 🚁 헬기 추락 (송전선로)</b><br/>'
+      + '회선 위의 <b>⚠ 마커를 탭</b>하면 가장 가까운 변전소에서 복구반(작업자)이 출동 → 휴전 작업(5초) → 복구. 보호협조 덕분에 그리드 전체 정전은 막지만 사고 처리비는 차감됩니다.<br/><br/>'
+      + '<b>🚧 지장전주 (전신주 이설)</b><br/>'
+      + '<b>1) 콘 마커를 탭</b> → 인접 헥스에 <b>녹색 후광</b>이 뜸 → <b>2) 후광을 탭</b>해서 이설 완료. 케이스별 정산: 도로 확장 +₩500, 사유지 −₩150, 건축 +₩300. 28초 방치 시 강제 철거 + −₩400.<br/><br/>'
+      + '<b>예방책</b>: 송전탑↔송전탑 회선의 가운데 점을 클릭해 <b>이중화(N-1)</b>하면 그쪽 사고가 나도 부하절체로 무중단 운영됩니다.'
+    ),
+    info: true,
+  },
 ];
 
 // Floating coach banner — fixed at the top center, large enough to read
-// but doesn't block the building palette below.
-function TutorialCoachBanner({ step, stepIndex, totalSteps, onSkip, compact }) {
+// but doesn't block the building palette below. Info-only steps (no build
+// requirement) show a primary "다음 →" button; build steps just have a
+// "스킵" secondary button and auto-advance once the requirement is met.
+function TutorialCoachBanner({ step, stepIndex, totalSteps, onSkip, onNext, compact }) {
+  const isInfo = !!step.info;
+  // Info steps tend to have rich bodies (smart grid, fault response) —
+  // give them a taller scrollable max-height so all content reads on
+  // both desktop and compact mobile.
   return (
     <div
       style={{
@@ -3612,9 +3701,9 @@ function TutorialCoachBanner({ step, stepIndex, totalSteps, onSkip, compact }) {
         borderRadius: 10,
         boxShadow: '0 0 18px rgba(0, 212, 255, 0.35)',
         color: '#e6f7ff',
-        padding: compact ? '6px 10px' : '10px 14px',
+        padding: compact ? '8px 10px' : '12px 14px',
         fontFamily: 'system-ui',
-        maxWidth: compact ? 320 : 460,
+        maxWidth: compact ? 340 : (isInfo ? 540 : 460),
         display: 'flex', alignItems: 'flex-start', gap: 10,
       }}
     >
@@ -3633,23 +3722,39 @@ function TutorialCoachBanner({ step, stepIndex, totalSteps, onSkip, compact }) {
         <div
           style={{
             fontSize: compact ? 11 : 12,
-            lineHeight: 1.45,
+            lineHeight: 1.55,
             color: '#cde',
+            maxHeight: isInfo ? (compact ? 200 : 280) : undefined,
+            overflowY: isInfo ? 'auto' : 'visible',
           }}
           dangerouslySetInnerHTML={{ __html: step.body }}
         />
       </div>
-      <button
-        onClick={onSkip}
-        style={{
-          background: 'transparent', color: '#7aa',
-          border: '1px solid #456', borderRadius: 4,
-          padding: '2px 8px', cursor: 'pointer',
-          fontSize: 10, fontFamily: 'system-ui',
-          flexShrink: 0,
-        }}
-        title="튜토리얼 건너뛰기"
-      >스킵</button>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flexShrink: 0 }}>
+        {isInfo && (
+          <button
+            onClick={onNext}
+            style={{
+              background: '#00d4ff', color: '#0a0e27',
+              border: 'none', borderRadius: 4,
+              padding: '4px 10px', cursor: 'pointer',
+              fontSize: 11, fontFamily: 'system-ui', fontWeight: 700,
+              whiteSpace: 'nowrap',
+            }}
+            title="다음 단계로"
+          >다음 →</button>
+        )}
+        <button
+          onClick={onSkip}
+          style={{
+            background: 'transparent', color: '#7aa',
+            border: '1px solid #456', borderRadius: 4,
+            padding: '2px 8px', cursor: 'pointer',
+            fontSize: 10, fontFamily: 'system-ui',
+          }}
+          title="튜토리얼 건너뛰기"
+        >스킵</button>
+      </div>
     </div>
   );
 }
@@ -4031,12 +4136,18 @@ function UI({
     persistCoach(done);
   };
 
-  // Auto-advance when the current step's requirement is met. Checks against
-  // the live buildings map + sunshineVillages from props.
+  // Auto-advance when the current step's requirement is met. Info steps
+  // (no requirement) wait for the user's explicit "다음 →" tap and are
+  // skipped here.
+  const advanceCoach = () => {
+    const next = coachStep + 1;
+    setCoachStep(next);
+    persistCoach(next);
+  };
   useEffect(() => {
     if (coachStep < 0 || coachStep >= INTERACTIVE_STEPS.length) return;
     const def = INTERACTIVE_STEPS[coachStep];
-    if (!def) return;
+    if (!def || def.info) return; // info steps advance only via "다음 →"
     let done = false;
     if (def.requiresVillage) {
       done = (sunshineVillages || []).length > 0;
@@ -4425,6 +4536,7 @@ function UI({
           stepIndex={coachStep}
           totalSteps={INTERACTIVE_STEPS.length}
           onSkip={skipCoach}
+          onNext={advanceCoach}
           compact={compact}
         />
       )}
@@ -4434,6 +4546,10 @@ function UI({
             const done = INTERACTIVE_STEPS.length + 1;
             setCoachStep(done);
             persistCoach(done);
+            // User asked for a fresh start after the tutorial — the
+            // practice grid is wiped so the actual run begins on a
+            // blank map with INITIAL_MONEY etc.
+            if (typeof onReset === 'function') onReset();
           }}
           compact={compact}
         />
