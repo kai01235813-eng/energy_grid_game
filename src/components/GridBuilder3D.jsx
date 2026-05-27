@@ -3724,7 +3724,7 @@ const INTERACTIVE_STEPS = [
       + '• 주파수 <b>60 Hz 위로 상승 → 충전</b> (잉여 흡수)<br/>'
       + '• 주파수 <b>60 Hz 아래로 하강 → 방전</b> (부족 보충)<br/>'
       + '변전소·전신주·데이터센터 옆에 두면 자동 작동합니다.<br/><br/>'
-      + '<b>지금 해보기</b>: 6단계의 태양광은 이미 설치돼 있습니다. <b>풍력 + ESS</b>를 한 기씩 추가하세요. 세 가지(태양광·풍력·ESS)가 모두 갖춰지면 자동으로 다음 단계.'
+      + '<b>지금 해보기</b>: <b>풍력 + ESS</b> 한 기씩 추가 (태양광은 6단계에서 이미 설치됨).'
     ),
     info: true,
     requiresAll: ['solar', 'wind', 'ess'],
@@ -3818,6 +3818,7 @@ const INTERACTIVE_STEPS = [
 function TutorialCoachBanner({
   step, stepIndex, totalSteps,
   onSkip, onNext, onPrev,
+  collapsed, onToggleCollapse,
   compact,
 }) {
   const isInfo = !!step.info;
@@ -3848,12 +3849,23 @@ function TutorialCoachBanner({
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{
           color: '#00d4ff', fontSize: compact ? 11 : 12, fontWeight: 700,
-          letterSpacing: 0.5, marginBottom: 2,
+          letterSpacing: 0.5,
+          marginBottom: collapsed ? 0 : 2,
           display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8,
         }}>
-          <span>단계 {stepIndex + 1}/{totalSteps} · {step.title}</span>
+          <span style={{
+            display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0,
+          }}>
+            <span style={{ whiteSpace: 'nowrap' }}>
+              단계 {stepIndex + 1}/{totalSteps}
+            </span>
+            <span style={{ opacity: 0.5 }}>·</span>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {step.title}
+            </span>
+          </span>
           {/* progress dots — compact-friendly visual progress indicator */}
-          {!compact && (
+          {!compact && !collapsed && (
             <span style={{ display: 'flex', gap: 3 }}>
               {Array.from({ length: totalSteps }).map((_, i) => (
                 <span key={i} style={{
@@ -3863,17 +3875,32 @@ function TutorialCoachBanner({
               ))}
             </span>
           )}
+          {/* Collapse toggle — lets the player hide the body so the banner
+              stops covering the game area while they take an action. */}
+          <button
+            onClick={onToggleCollapse}
+            title={collapsed ? '설명 펼치기' : '설명 접기 (게임 화면 가림 방지)'}
+            style={{
+              background: 'transparent', color: '#7fc8ff',
+              border: '1px solid #2a4a6e', borderRadius: 4,
+              padding: '1px 7px', cursor: 'pointer',
+              fontSize: 11, fontFamily: 'system-ui',
+              flexShrink: 0,
+            }}
+          >{collapsed ? '▼ 펼치기' : '▲ 접기'}</button>
         </div>
-        <div
-          style={{
-            fontSize: compact ? 11 : 12,
-            lineHeight: 1.55,
-            color: '#cde',
-            maxHeight: isInfo ? (compact ? 200 : 280) : undefined,
-            overflowY: isInfo ? 'auto' : 'visible',
-          }}
-          dangerouslySetInnerHTML={{ __html: step.body }}
-        />
+        {!collapsed && (
+          <div
+            style={{
+              fontSize: compact ? 11 : 12,
+              lineHeight: 1.55,
+              color: '#cde',
+              maxHeight: isInfo ? (compact ? 200 : 280) : undefined,
+              overflowY: isInfo ? 'auto' : 'visible',
+            }}
+            dangerouslySetInnerHTML={{ __html: step.body }}
+          />
+        )}
       </div>
       <div style={{
         display: 'flex', flexDirection: 'column', gap: 4,
@@ -4288,6 +4315,12 @@ function UI({
   //   N       = celebration modal
   //   N+1     = done (banner hidden)
   const [coachStep, setCoachStep] = useState(0);
+  // Banner collapse state — lets the player fold the long info bodies away
+  // so the banner doesn't cover gameplay while they take action. Auto-
+  // expand on step change so they see new instructions, then they can
+  // collapse again if needed.
+  const [coachCollapsed, setCoachCollapsed] = useState(false);
+  useEffect(() => { setCoachCollapsed(false); }, [coachStep]);
   // High-water mark — highest step the player has reached this session.
   // Used so going back via "이전" lands in pure-read mode (no immediate
   // auto-advance even if the build requirement was already satisfied
@@ -4750,7 +4783,9 @@ function UI({
       )}
 
       {/* Interactive coach — shows every time the 3D mode mounts. Buttons:
-          이전 (review prior step), 다음 → (advance manually), 스킵 (dismiss). */}
+          이전 (review prior step), 다음 → (advance manually), 스킵 (dismiss).
+          접기 button collapses the body so the banner stops blocking the
+          game area. */}
       {showCoachBanner && (
         <TutorialCoachBanner
           step={INTERACTIVE_STEPS[coachStep]}
@@ -4759,6 +4794,8 @@ function UI({
           onSkip={skipCoach}
           onNext={advanceCoach}
           onPrev={goPrevCoach}
+          collapsed={coachCollapsed}
+          onToggleCollapse={() => setCoachCollapsed((c) => !c)}
           compact={compact}
         />
       )}
