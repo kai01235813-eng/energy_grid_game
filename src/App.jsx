@@ -60,25 +60,31 @@ function isMobileUA() {
     && /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '');
 }
 
-// First-tap fullscreen latch — needed because the Fullscreen API requires a
-// user gesture, so a returning player whose mode is restored from localStorage
-// (skipping ModeSelect) would see the browser chrome until they happened to
-// tap a HUD button. We attach a one-shot pointerdown listener on mount and
-// surface a small "tap to start" hint so the player knows what to do.
+// First-tap fullscreen — Fullscreen API requires a user gesture, so we
+// can't autostart. Strategy: while on mobile + not currently fullscreen,
+// install a global pointerdown listener that requests fullscreen on EVERY
+// tap (no-op if already in). Also surface a visible prompt so users know
+// to tap. fullscreenchange events keep the React side in sync — exit
+// fullscreen (back gesture, ESC) → the prompt reappears.
 function FirstTapFullscreen() {
-  const [shouldShow, setShouldShow] = useState(
-    () => isMobileUA() && !isInFullscreen() && !isStandalonePWA() && !isIPhone(),
-  );
+  const wantsPrompt = isMobileUA() && !isStandalonePWA() && !isIPhone();
+  const [inFs, setInFs] = useState(() => isInFullscreen());
   useEffect(() => {
-    if (!shouldShow) return;
-    const onFirstTap = () => {
-      activateFullscreenAndLockLandscape();
-      setShouldShow(false);
+    if (!wantsPrompt) return;
+    const onChange = () => setInFs(isInFullscreen());
+    document.addEventListener('fullscreenchange', onChange);
+    document.addEventListener('webkitfullscreenchange', onChange);
+    const onTap = () => {
+      if (!isInFullscreen()) activateFullscreenAndLockLandscape();
     };
-    document.addEventListener('pointerdown', onFirstTap, { once: true });
-    return () => document.removeEventListener('pointerdown', onFirstTap);
-  }, [shouldShow]);
-  if (!shouldShow) return null;
+    document.addEventListener('pointerdown', onTap);
+    return () => {
+      document.removeEventListener('fullscreenchange', onChange);
+      document.removeEventListener('webkitfullscreenchange', onChange);
+      document.removeEventListener('pointerdown', onTap);
+    };
+  }, [wantsPrompt]);
+  if (!wantsPrompt || inFs) return null;
   return (
     <div
       style={{

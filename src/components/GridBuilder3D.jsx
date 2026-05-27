@@ -3540,13 +3540,175 @@ function DifficultyMeter({ difficulty }) {
 }
 
 // ────────── Tutorial / rules modal ──────────
-// One-time first-launch tutorial + always-available "?" button. Bumping
-// TUTORIAL_VERSION re-shows the modal to returning players so they catch
-// significant rule changes.
-// Bump this version whenever the rules in TUTORIAL_SECTIONS change in a way
-// returning players should be re-prompted to read. v2: clarified 인접 단지
-// rule, added 지장전주, switched to protection-coordination fault model.
+// One-time first-launch RULES reference + always-available "?" button.
+// Distinct from the new interactive tutorial coach below — this modal is
+// the searchable text reference, opened on demand. The interactive coach
+// walks brand-new players through actually building each piece.
 const TUTORIAL_KEY = 'eg_tutorial_seen_v2';
+
+// Per-step interactive tutorial config. Each step waits until the player
+// completes the requirement, then auto-advances. `requiresType` + count is
+// the simplest check (does the buildings map have N of this type?).
+// `requiresVillage` is a special check for the final 햇빛소득마을 step.
+const TUTORIAL_PROGRESS_KEY = 'eg_tutorial_progress_v1';
+const INTERACTIVE_STEPS = [
+  {
+    icon: '🏭',
+    title: '발전소 짓기',
+    body: '하단 팔레트 좌측의 <b>발전소</b> 카드를 탭하고, 빈 헥스를 클릭해 한 기를 설치하세요. 전력의 시작점입니다.',
+    requiresType: 'powerPlant', count: 1,
+    highlight: 'powerPlant',
+  },
+  {
+    icon: '🗼',
+    title: '송전탑 짓기',
+    body: '발전소에서 나온 고압 전기를 옮기는 <b>송전탑</b>입니다. 발전소 옆 헥스에 한 기를 설치해 보세요. (송전탑은 사거리 2칸)',
+    requiresType: 'pylon', count: 1,
+    highlight: 'pylon',
+  },
+  {
+    icon: '⚡',
+    title: '변전소 짓기',
+    body: '고압을 저압으로 바꾸는 <b>변전소</b>입니다. 송전탑 옆 헥스에 설치하세요. 가정에 전기를 보내려면 반드시 거쳐야 합니다.',
+    requiresType: 'substation', count: 1,
+    highlight: 'substation',
+  },
+  {
+    icon: '📡',
+    title: '전신주 짓기',
+    body: '동네까지 22.9 kV로 분배하는 <b>전신주</b>입니다. 변전소 옆 헥스에 설치하세요.',
+    requiresType: 'utilityPole', count: 1,
+    highlight: 'utilityPole',
+  },
+  {
+    icon: '🏠',
+    title: '가정 짓기 — 첫 점등',
+    body: '드디어 소비처입니다! <b>가정</b>을 전신주 옆에 설치해 보세요. 회선이 제대로 이어졌다면 창문에 불이 들어옵니다.',
+    requiresType: 'house', count: 1,
+    highlight: 'house',
+  },
+  {
+    icon: '☀️',
+    title: '햇빛소득마을 도전',
+    body: '<b>태양광 3기</b>를 서로 바로 인접한 헥스에 설치하면 햇빛소득마을 보너스가 활성화됩니다. (태양광은 변전소나 송전탑에 연결해야 점등)',
+    requiresVillage: true,
+    highlight: 'solar',
+  },
+];
+
+// Floating coach banner — fixed at the top center, large enough to read
+// but doesn't block the building palette below.
+function TutorialCoachBanner({ step, stepIndex, totalSteps, onSkip, compact }) {
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        top: compact ? 4 : 12,
+        left: '50%',
+        transform: 'translateX(-50%)',
+        zIndex: 9000,
+        background: 'rgba(10, 14, 39, 0.96)',
+        border: '1px solid #00d4ff',
+        borderRadius: 10,
+        boxShadow: '0 0 18px rgba(0, 212, 255, 0.35)',
+        color: '#e6f7ff',
+        padding: compact ? '6px 10px' : '10px 14px',
+        fontFamily: 'system-ui',
+        maxWidth: compact ? 320 : 460,
+        display: 'flex', alignItems: 'flex-start', gap: 10,
+      }}
+    >
+      <div style={{
+        fontSize: compact ? 22 : 28,
+        flexShrink: 0,
+        marginTop: 1,
+      }}>{step.icon}</div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{
+          color: '#00d4ff', fontSize: compact ? 11 : 12, fontWeight: 700,
+          letterSpacing: 0.5, marginBottom: 2,
+        }}>
+          단계 {stepIndex + 1}/{totalSteps} · {step.title}
+        </div>
+        <div
+          style={{
+            fontSize: compact ? 11 : 12,
+            lineHeight: 1.45,
+            color: '#cde',
+          }}
+          dangerouslySetInnerHTML={{ __html: step.body }}
+        />
+      </div>
+      <button
+        onClick={onSkip}
+        style={{
+          background: 'transparent', color: '#7aa',
+          border: '1px solid #456', borderRadius: 4,
+          padding: '2px 8px', cursor: 'pointer',
+          fontSize: 10, fontFamily: 'system-ui',
+          flexShrink: 0,
+        }}
+        title="튜토리얼 건너뛰기"
+      >스킵</button>
+    </div>
+  );
+}
+
+// Completion celebration — shown after step 6 (sunshine village). Auto-
+// dismisses on backdrop tap or "free play" button.
+function TutorialCompleteModal({ onClose, compact }) {
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: 'absolute', inset: 0,
+        zIndex: 10000,
+        background: 'rgba(5, 8, 22, 0.85)',
+        backdropFilter: 'blur(4px)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: 24, fontFamily: 'system-ui',
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          maxWidth: compact ? 340 : 460,
+          background: 'rgba(12,16,32,0.97)',
+          border: '1px solid #ffd86b',
+          borderRadius: 14,
+          padding: compact ? '20px 22px' : '28px 32px',
+          color: '#e6f7ff', textAlign: 'center',
+          boxShadow: '0 0 40px rgba(255,216,107,0.3)',
+        }}
+      >
+        <div style={{ fontSize: 56, marginBottom: 12 }}>🎉</div>
+        <div style={{
+          color: '#ffd86b', fontWeight: 700,
+          fontSize: compact ? 18 : 22, marginBottom: 8,
+        }}>
+          튜토리얼 완료!
+        </div>
+        <div style={{
+          color: '#bcd', fontSize: compact ? 12 : 13, lineHeight: 1.65,
+          marginBottom: 18,
+        }}>
+          이제 자유롭게 그리드를 확장하고 사고에 대응하며 점수를 모으세요.<br />
+          상세 룰은 우상단 <b style={{ color: '#7fc8ff' }}>?</b> 버튼으로 언제든 다시 볼 수 있습니다.
+        </div>
+        <button
+          onClick={onClose}
+          style={{
+            background: '#ffd86b', color: '#0a0e27',
+            border: 'none', borderRadius: 8,
+            padding: '10px 24px', cursor: 'pointer',
+            fontSize: compact ? 13 : 14, fontWeight: 700,
+            fontFamily: 'system-ui',
+          }}
+        >자유 플레이 시작 →</button>
+      </div>
+    </div>
+  );
+}
 const TUTORIAL_SECTIONS = [
   {
     icon: '🎯',
@@ -3843,16 +4005,55 @@ function UI({
 }) {
   const [showBoard, setShowBoard] = useState(false);
   const compact = useIsCompact();
-  // Tutorial modal — auto-shown on first launch (localStorage flag), and
-  // re-openable anytime via the "?" HUD button.
-  const [showTutorial, setShowTutorial] = useState(() => {
-    try { return localStorage.getItem(TUTORIAL_KEY) !== '1'; }
-    catch (_) { return false; }
-  });
+  // Rules modal — opened ONLY via the "?" button. The first-time experience
+  // is now the interactive coach below, not this text reference.
+  const [showTutorial, setShowTutorial] = useState(false);
   const closeTutorial = () => {
     setShowTutorial(false);
     try { localStorage.setItem(TUTORIAL_KEY, '1'); } catch (_) {}
   };
+
+  // Interactive tutorial coach — step number tracks progress through
+  // INTERACTIVE_STEPS. 0..(N-1) = active step, N = celebration modal,
+  // N+1 = done (banner hidden, no further auto-advance).
+  const [coachStep, setCoachStep] = useState(() => {
+    try {
+      const saved = localStorage.getItem(TUTORIAL_PROGRESS_KEY);
+      return saved != null ? parseInt(saved, 10) : 0;
+    } catch (_) { return 0; }
+  });
+  const persistCoach = (n) => {
+    try { localStorage.setItem(TUTORIAL_PROGRESS_KEY, String(n)); } catch (_) {}
+  };
+  const skipCoach = () => {
+    const done = INTERACTIVE_STEPS.length + 1;
+    setCoachStep(done);
+    persistCoach(done);
+  };
+
+  // Auto-advance when the current step's requirement is met. Checks against
+  // the live buildings map + sunshineVillages from props.
+  useEffect(() => {
+    if (coachStep < 0 || coachStep >= INTERACTIVE_STEPS.length) return;
+    const def = INTERACTIVE_STEPS[coachStep];
+    if (!def) return;
+    let done = false;
+    if (def.requiresVillage) {
+      done = (sunshineVillages || []).length > 0;
+    } else if (def.requiresType) {
+      let n = 0;
+      for (const [, b] of buildings) if (b.type === def.requiresType) n++;
+      done = n >= (def.count || 1);
+    }
+    if (done) {
+      const next = coachStep + 1;
+      setCoachStep(next);
+      persistCoach(next);
+    }
+  }, [coachStep, buildings, sunshineVillages]);
+
+  const showCoachBanner = coachStep >= 0 && coachStep < INTERACTIVE_STEPS.length;
+  const showCoachComplete = coachStep === INTERACTIVE_STEPS.length;
 
   // Live advisor tip — recomputed whenever the relevant slice of state moves.
   // Deps kept narrow so we don't churn the tip every dyn pulse.
@@ -4211,9 +4412,31 @@ function UI({
         />
       )}
 
-      {/* Tutorial / rules — auto on first run, ? button anytime */}
+      {/* Rules reference — opens via the "?" button only. */}
       {showTutorial && (
         <TutorialModal onClose={closeTutorial} compact={compact} />
+      )}
+
+      {/* Interactive coach — auto on first run, advances as the player
+          completes each build step. Skip button bails out to free play. */}
+      {showCoachBanner && (
+        <TutorialCoachBanner
+          step={INTERACTIVE_STEPS[coachStep]}
+          stepIndex={coachStep}
+          totalSteps={INTERACTIVE_STEPS.length}
+          onSkip={skipCoach}
+          compact={compact}
+        />
+      )}
+      {showCoachComplete && (
+        <TutorialCompleteModal
+          onClose={() => {
+            const done = INTERACTIVE_STEPS.length + 1;
+            setCoachStep(done);
+            persistCoach(done);
+          }}
+          compact={compact}
+        />
       )}
 
       {/* Hover tooltip — info about the hex under the cursor */}
