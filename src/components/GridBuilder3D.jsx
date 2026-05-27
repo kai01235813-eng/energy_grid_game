@@ -3543,7 +3543,10 @@ function DifficultyMeter({ difficulty }) {
 // One-time first-launch tutorial + always-available "?" button. Bumping
 // TUTORIAL_VERSION re-shows the modal to returning players so they catch
 // significant rule changes.
-const TUTORIAL_KEY = 'eg_tutorial_seen_v1';
+// Bump this version whenever the rules in TUTORIAL_SECTIONS change in a way
+// returning players should be re-prompted to read. v2: clarified 인접 단지
+// rule, added 지장전주, switched to protection-coordination fault model.
+const TUTORIAL_KEY = 'eg_tutorial_seen_v2';
 const TUTORIAL_SECTIONS = [
   {
     icon: '🎯',

@@ -55,6 +55,57 @@ function isStandalonePWA() {
     || window.matchMedia('(display-mode: standalone)').matches;
 }
 
+function isMobileUA() {
+  return typeof navigator !== 'undefined'
+    && /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '');
+}
+
+// First-tap fullscreen latch — needed because the Fullscreen API requires a
+// user gesture, so a returning player whose mode is restored from localStorage
+// (skipping ModeSelect) would see the browser chrome until they happened to
+// tap a HUD button. We attach a one-shot pointerdown listener on mount and
+// surface a small "tap to start" hint so the player knows what to do.
+function FirstTapFullscreen() {
+  const [shouldShow, setShouldShow] = useState(
+    () => isMobileUA() && !isInFullscreen() && !isStandalonePWA() && !isIPhone(),
+  );
+  useEffect(() => {
+    if (!shouldShow) return;
+    const onFirstTap = () => {
+      activateFullscreenAndLockLandscape();
+      setShouldShow(false);
+    };
+    document.addEventListener('pointerdown', onFirstTap, { once: true });
+    return () => document.removeEventListener('pointerdown', onFirstTap);
+  }, [shouldShow]);
+  if (!shouldShow) return null;
+  return (
+    <div
+      style={{
+        position: 'fixed', inset: 0,
+        zIndex: 99999,
+        background: 'rgba(5, 8, 22, 0.78)',
+        display: 'flex', flexDirection: 'column',
+        alignItems: 'center', justifyContent: 'center',
+        color: '#e6f7ff', fontFamily: 'system-ui',
+        textAlign: 'center', padding: 24,
+        pointerEvents: 'none', /* tap passes through to document handler */
+      }}
+    >
+      <div style={{ fontSize: 56, marginBottom: 16 }}>👆</div>
+      <div style={{
+        color: '#00d4ff', fontWeight: 700, fontSize: 18, marginBottom: 6,
+      }}>
+        화면을 탭해 전체화면으로 시작
+      </div>
+      <div style={{ color: '#9ab', fontSize: 12, lineHeight: 1.6, maxWidth: 320 }}>
+        모바일 브라우저는 보안상 자동으로 전체화면을 켤 수 없습니다.<br />
+        아무 곳이나 한 번 탭하면 주소창이 사라지고 가로 모드로 시작됩니다.
+      </div>
+    </div>
+  );
+}
+
 // Mobile portrait is hostile to this UI — HUD panels and the bottom palette
 // assume a wide viewport. CSS-driven overlay (no JS resize listener needed)
 // renders only when the device is small AND in portrait. Class lives in
@@ -137,6 +188,7 @@ function App() {
     return (
       <>
         <ModeSelect onSelect={switchMode} />
+        <FirstTapFullscreen />
         <RotateDevicePrompt />
       </>
     );
@@ -168,6 +220,7 @@ function App() {
         {mode === 'phaser' && <SmartGridGame />}
         {mode === 'r3f' && <GridBuilder3D />}
         {mode === 'edu' && <EducationMode />}
+        <FirstTapFullscreen />
         <RotateDevicePrompt />
       </div>
     </ErrorBoundary>
