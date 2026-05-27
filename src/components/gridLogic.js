@@ -446,10 +446,11 @@ export function buildRenewableClusterMap(buildings) {
 //         re-fire the achievement toast for the same village.
 //   centroid — for placing the visual effect on the map.
 const SUNSHINE_MIN_CLUSTER = 3;
-// Bumped 2 → 3 after playtesters reported 3 panels not registering as a
-// village when they spaced them apart by a single empty hex (which reads
-// as "close together" to the eye but hex-distance is actually 2-3).
-const SUNSHINE_LINK_DISTANCE = 3;
+// Strict adjacency (distance = 1). Panels must share a hex edge to count
+// as the same cluster — a line of 3 (A↔B↔C) qualifies via transitive
+// union, but a 1-hex gap breaks it. Designer call: "village" should feel
+// like 단지 (압축 클러스터), not a loose group.
+const SUNSHINE_LINK_DISTANCE = 1;
 export function findSunshineVillages(buildings) {
   const solars = [];
   for (const [k, b] of buildings) {
@@ -626,8 +627,40 @@ export function simulate(buildings, disabledKeys = null, disabledEdges = null, t
     for (const key of c.members) powered[key] = ok;
   }
 
-  const totalSupply = entries.reduce((s, e) => s + e.supply, 0);
-  const totalDemand = entries.reduce((s, e) => s + e.demand, 0);
+  // Frequency math needs to reflect ONLY the live grid — the supply and
+  // demand that are actually connected. Previously totals summed every
+  // entry, so a player whose downstream just got severed by a fault could
+  // see "freq stable, every house dark" because the disconnected source +
+  // disconnected load cancelled out in the totals. With this change a
+  // severed segment immediately registers as over-frequency on the source
+  // side, matching real-world rotor dynamics and giving the player a
+  // legible signal that the topology — not the balance — is broken.
+  let totalSupply = 0;
+  let totalDemand = 0;
+  for (const c of comps.values()) {
+    const ok = c.supply > 0 && c.supply >= c.demand;
+    if (ok) {
+      totalSupply += c.supply;
+      totalDemand += c.demand;
+    } else {
+      // Source islands (powerPlant alone, no loads) → c.supply > 0 but
+      // c.demand may be 0. They're 'powered' by the rule above and DO
+      // contribute their full supply with zero matching load, which
+      // realistically drives over-frequency.
+      if (c.supply > 0) totalSupply += c.supply;
+      // c.demand from an unpowered component is "stranded" — it's load
+      // the operator wants to serve but can't reach. We don't sum it
+      // into totalDemand because there's no machine torque opposing the
+      // generators; instead exporters track it separately as a hint.
+    }
+  }
+  // Demand currently stranded (unpowered consumers). Used by the HUD /
+  // advisor to surface the "왜 안정인데 다 정전?" situation explicitly.
+  let strandedDemand = 0;
+  for (const c of comps.values()) {
+    const ok = c.supply > 0 && c.supply >= c.demand;
+    if (!ok) strandedDemand += c.demand;
+  }
 
   // Expose which connected component each building belongs to. Downstream
   // code (data-center "loop-fed" check) uses this to walk a single component
@@ -642,7 +675,7 @@ export function simulate(buildings, disabledKeys = null, disabledEdges = null, t
     edges,
     powered,
     componentBy,
-    totals: { supply: totalSupply, demand: totalDemand },
+    totals: { supply: totalSupply, demand: totalDemand, strandedDemand },
   };
 }
 

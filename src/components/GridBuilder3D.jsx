@@ -93,7 +93,12 @@ function useIsCompact() {
   }, []);
   return compact;
 }
-const MOBILE_DPR = [1, 1];
+// DPR balance: phones often have native DPR 2~3. Pinning to 1 was great
+// for thermals but made the canvas read as ~1/4 resolution → blurry. 1.5
+// cap regains visible sharpness on edges + emissive panels while still
+// using ~44% fewer pixels than full native 2.0. Pair with antialias on
+// the smaller framebuffer for crisp building silhouettes.
+const MOBILE_DPR = [1, 1.5];
 const DESKTOP_DPR = [1, 2];
 const MOBILE_FRAME_INTERVAL_MS = 1000 / 30; // 30 fps target on phones
 // React-side dynamics push throttle — mobile gets a slower HUD update so the
@@ -2080,9 +2085,18 @@ export default function GridBuilder3D() {
     return s;
   }, [events]);
   const windActive = events.some((e) => e.type === 'wind');
+  // Protection-coordination assumption: a transmission-line fault does NOT
+  // cascade the way a naive open-circuit would. Real relays trip just the
+  // faulted span and leave the surrounding network energised; in-game we
+  // model that by passing `null` for disabledEdges to simulate(). The
+  // fault still shows visually (FaultMarker, sparks, line tint) and still
+  // costs money (upfront fee + ongoing drain on any actually-dark
+  // consumers), but power keeps flowing through the rest of the grid.
+  // Player feedback: previously a single line break could black-out an
+  // entire radial branch, which felt unfair given protection equipment.
   const sim = useMemo(
-    () => simulate(buildings, disabledKeys, faultedEdges, terrainLookup, redundantEdges),
-    [buildings, disabledKeys, faultedEdges, terrainLookup, redundantEdges],
+    () => simulate(buildings, disabledKeys, null, terrainLookup, redundantEdges),
+    [buildings, disabledKeys, terrainLookup, redundantEdges],
   );
 
   // ────── Repair worker dispatch ──────
@@ -2913,8 +2927,11 @@ export default function GridBuilder3D() {
         dpr={IS_MOBILE ? MOBILE_DPR : DESKTOP_DPR}
         flat
         frameloop="always"
+        // MSAA on both — at DPR 1.5 on mobile, the fragment cost stays
+        // manageable while edges/wires read crisply. Earlier "AA off on
+        // mobile" was the wrong knob to tune for thermals; DPR cap was.
         gl={{
-          antialias: !IS_MOBILE,
+          antialias: true,
           powerPreference: 'high-performance',
           stencil: false,
           depth: true,
@@ -3242,7 +3259,7 @@ function detectRadialSubstations(buildings, edges) {
 // should take right now and presents it as a tip. Priority is fixed: safety
 // (블랙아웃) > 사고 (정전·자금) > 계통 안정 (주파수·미점등) > 운영 팁. We render
 // only the top-priority tip to avoid an info wall.
-function operatingAdvice({ freq, money, faults, workers, buildings, powered, count, edges, events, sunshineVillages }) {
+function operatingAdvice({ freq, money, faults, workers, buildings, powered, count, edges, events, sunshineVillages, strandedDemand }) {
   const dev = Math.abs(freq - NOMINAL_FREQ);
   const high = freq > NOMINAL_FREQ;
 
@@ -3309,6 +3326,19 @@ function operatingAdvice({ freq, money, faults, workers, buildings, powered, cou
     };
   }
 
+  // Stranded loads — consumers exist but they're not in any powered
+  // component (e.g., a fault severed the only feed). Surface this BEFORE
+  // freq drift because freq might still read stable-ish while every
+  // building is dark — the topology is broken, not the balance.
+  if (strandedDemand && strandedDemand >= 20) {
+    return {
+      level: 'urgent',
+      icon: '🔌',
+      title: `${strandedDemand} MW 소비처가 그리드에서 끊김`,
+      body: '주파수와 무관하게 일부(또는 전체) 가정/마을이 정전입니다. 발전소→송전탑→변전소→전신주 체인 중 어디가 끊겼는지 확인하세요. 변전소가 빠지면 고압↔저압이 안 연결되고, 사고로 송전탑이 disabled 됐을 수 있습니다.',
+    };
+  }
+
   // Frequency drift — explain the rule
   if (dev > 0.5) {
     return high
@@ -3365,7 +3395,7 @@ function operatingAdvice({ freq, money, faults, workers, buildings, powered, cou
         level: 'info',
         icon: '☀️',
         title: `태양광 ${solarCount}기 — 단지 미형성`,
-        body: '햇빛소득마을 단지 보너스를 받으려면 태양광 3기 이상을 서로 가까이(인접 2~3 헥스 이내) 모아 설치하세요. 단지가 완성되면 황금 광주(光柱)와 함께 일회 보너스 + 패널당 분당 수익이 들어옵니다.',
+        body: '햇빛소득마을 단지 보너스를 받으려면 태양광 3기 이상을 서로 바로 인접한 헥스(거리 1)로 모아 설치하세요. 단지가 완성되면 황금 링과 함께 일회 보너스 + 패널당 분당 수익이 들어옵니다.',
       };
     }
   }
@@ -3550,7 +3580,7 @@ const TUTORIAL_SECTIONS = [
       '태양광·풍력: 자동 출력제어로 과공급 자동 감쇠',
       '소규모(1~2기)는 전신주·가정에 직접, 대규모(3기+ 단지)는 송전탑/변전소 필수',
       'ESS: 변전소·전신주·데이터센터에 연결 → 자동 충방전으로 주파수 보조',
-      '태양광 3기를 가까이 모으면 햇빛소득마을 → 일회 보너스 + 분당 수익',
+      '태양광 3기를 바로 인접해(거리 1) 모으면 햇빛소득마을 → 일회 보너스 + 분당 수익',
     ],
   },
   {
