@@ -3599,7 +3599,8 @@ const TUTORIAL_KEY = 'eg_tutorial_seen_v2';
 // completes the requirement, then auto-advances. `requiresType` + count is
 // the simplest check (does the buildings map have N of this type?).
 // `requiresVillage` is a special check for the final 햇빛소득마을 step.
-const TUTORIAL_PROGRESS_KEY = 'eg_tutorial_progress_v1';
+// (Progress is intentionally NOT persisted to localStorage — the coach
+// re-runs every time the 3D mode mounts, per playtester request.)
 const INTERACTIVE_STEPS = [
   {
     icon: '🏭',
@@ -3679,15 +3680,16 @@ const INTERACTIVE_STEPS = [
   },
 ];
 
-// Floating coach banner — fixed at the top center, large enough to read
-// but doesn't block the building palette below. Info-only steps (no build
-// requirement) show a primary "다음 →" button; build steps just have a
-// "스킵" secondary button and auto-advance once the requirement is met.
-function TutorialCoachBanner({ step, stepIndex, totalSteps, onSkip, onNext, compact }) {
+// Floating coach banner — fixed at the top center. ← 이전 / 다음 → / 스킵
+// buttons let the player navigate freely. Build steps still auto-advance
+// once their requirement is met, but ONLY when the player is on the
+// "leading edge" of progress (not reviewing a previous step).
+function TutorialCoachBanner({
+  step, stepIndex, totalSteps,
+  onSkip, onNext, onPrev,
+  compact,
+}) {
   const isInfo = !!step.info;
-  // Info steps tend to have rich bodies (smart grid, fault response) —
-  // give them a taller scrollable max-height so all content reads on
-  // both desktop and compact mobile.
   return (
     <div
       style={{
@@ -3716,8 +3718,20 @@ function TutorialCoachBanner({ step, stepIndex, totalSteps, onSkip, onNext, comp
         <div style={{
           color: '#00d4ff', fontSize: compact ? 11 : 12, fontWeight: 700,
           letterSpacing: 0.5, marginBottom: 2,
+          display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8,
         }}>
-          단계 {stepIndex + 1}/{totalSteps} · {step.title}
+          <span>단계 {stepIndex + 1}/{totalSteps} · {step.title}</span>
+          {/* progress dots — compact-friendly visual progress indicator */}
+          {!compact && (
+            <span style={{ display: 'flex', gap: 3 }}>
+              {Array.from({ length: totalSteps }).map((_, i) => (
+                <span key={i} style={{
+                  width: 6, height: 6, borderRadius: 3,
+                  background: i === stepIndex ? '#00d4ff' : (i < stepIndex ? '#3a5a7a' : '#1c2640'),
+                }} />
+              ))}
+            </span>
+          )}
         </div>
         <div
           style={{
@@ -3730,20 +3744,36 @@ function TutorialCoachBanner({ step, stepIndex, totalSteps, onSkip, onNext, comp
           dangerouslySetInnerHTML={{ __html: step.body }}
         />
       </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flexShrink: 0 }}>
-        {isInfo && (
-          <button
-            onClick={onNext}
-            style={{
-              background: '#00d4ff', color: '#0a0e27',
-              border: 'none', borderRadius: 4,
-              padding: '4px 10px', cursor: 'pointer',
-              fontSize: 11, fontFamily: 'system-ui', fontWeight: 700,
-              whiteSpace: 'nowrap',
-            }}
-            title="다음 단계로"
-          >다음 →</button>
-        )}
+      <div style={{
+        display: 'flex', flexDirection: 'column', gap: 4,
+        flexShrink: 0, alignItems: 'stretch',
+      }}>
+        <button
+          onClick={onNext}
+          style={{
+            background: '#00d4ff', color: '#0a0e27',
+            border: 'none', borderRadius: 4,
+            padding: '4px 10px', cursor: 'pointer',
+            fontSize: 11, fontFamily: 'system-ui', fontWeight: 700,
+            whiteSpace: 'nowrap',
+          }}
+          title="다음 단계로"
+        >다음 →</button>
+        <button
+          onClick={onPrev}
+          disabled={stepIndex === 0}
+          style={{
+            background: 'transparent',
+            color: stepIndex === 0 ? '#345' : '#7fc8ff',
+            border: `1px solid ${stepIndex === 0 ? '#234' : '#7fc8ff'}`,
+            borderRadius: 4,
+            padding: '3px 10px',
+            cursor: stepIndex === 0 ? 'not-allowed' : 'pointer',
+            fontSize: 11, fontFamily: 'system-ui',
+            whiteSpace: 'nowrap',
+          }}
+          title="이전 단계 다시 읽기"
+        >← 이전</button>
         <button
           onClick={onSkip}
           style={{
@@ -4118,36 +4148,36 @@ function UI({
     try { localStorage.setItem(TUTORIAL_KEY, '1'); } catch (_) {}
   };
 
-  // Interactive tutorial coach — step number tracks progress through
-  // INTERACTIVE_STEPS. 0..(N-1) = active step, N = celebration modal,
-  // N+1 = done (banner hidden, no further auto-advance).
-  const [coachStep, setCoachStep] = useState(() => {
-    try {
-      const saved = localStorage.getItem(TUTORIAL_PROGRESS_KEY);
-      return saved != null ? parseInt(saved, 10) : 0;
-    } catch (_) { return 0; }
-  });
-  const persistCoach = (n) => {
-    try { localStorage.setItem(TUTORIAL_PROGRESS_KEY, String(n)); } catch (_) {}
+  // Interactive tutorial coach — per user request, ALWAYS starts at step 0
+  // when the 3D Grid Builder mounts. No localStorage persistence; skip is
+  // session-only. If the player re-enters the mode they'll see the
+  // tutorial from the top again (skip button dismisses).
+  //   0..(N-1) = active step
+  //   N       = celebration modal
+  //   N+1     = done (banner hidden)
+  const [coachStep, setCoachStep] = useState(0);
+  // High-water mark — highest step the player has reached this session.
+  // Used so going back via "이전" lands in pure-read mode (no immediate
+  // auto-advance even if the build requirement was already satisfied
+  // before they went back).
+  const coachHighWaterRef = useRef(0);
+  const goToStep = (next) => {
+    if (next > coachHighWaterRef.current) coachHighWaterRef.current = next;
+    setCoachStep(next);
   };
-  const skipCoach = () => {
-    const done = INTERACTIVE_STEPS.length + 1;
-    setCoachStep(done);
-    persistCoach(done);
-  };
+  const advanceCoach = () => goToStep(coachStep + 1);
+  const goPrevCoach  = () => { if (coachStep > 0) goToStep(coachStep - 1); };
+  const skipCoach    = () => goToStep(INTERACTIVE_STEPS.length + 1);
 
   // Auto-advance when the current step's requirement is met. Info steps
-  // (no requirement) wait for the user's explicit "다음 →" tap and are
-  // skipped here.
-  const advanceCoach = () => {
-    const next = coachStep + 1;
-    setCoachStep(next);
-    persistCoach(next);
-  };
+  // (no requirement) wait for the user's explicit "다음 →" tap. Reviewing
+  // a previous step (coachStep < high-water) also skips auto-advance so
+  // the player can actually re-read it.
   useEffect(() => {
     if (coachStep < 0 || coachStep >= INTERACTIVE_STEPS.length) return;
+    if (coachStep < coachHighWaterRef.current) return; // pure review mode
     const def = INTERACTIVE_STEPS[coachStep];
-    if (!def || def.info) return; // info steps advance only via "다음 →"
+    if (!def || def.info) return; // info steps need "다음 →"
     let done = false;
     if (def.requiresVillage) {
       done = (sunshineVillages || []).length > 0;
@@ -4156,11 +4186,7 @@ function UI({
       for (const [, b] of buildings) if (b.type === def.requiresType) n++;
       done = n >= (def.count || 1);
     }
-    if (done) {
-      const next = coachStep + 1;
-      setCoachStep(next);
-      persistCoach(next);
-    }
+    if (done) goToStep(coachStep + 1);
   }, [coachStep, buildings, sunshineVillages]);
 
   const showCoachBanner = coachStep >= 0 && coachStep < INTERACTIVE_STEPS.length;
@@ -4528,8 +4554,8 @@ function UI({
         <TutorialModal onClose={closeTutorial} compact={compact} />
       )}
 
-      {/* Interactive coach — auto on first run, advances as the player
-          completes each build step. Skip button bails out to free play. */}
+      {/* Interactive coach — shows every time the 3D mode mounts. Buttons:
+          이전 (review prior step), 다음 → (advance manually), 스킵 (dismiss). */}
       {showCoachBanner && (
         <TutorialCoachBanner
           step={INTERACTIVE_STEPS[coachStep]}
@@ -4537,18 +4563,17 @@ function UI({
           totalSteps={INTERACTIVE_STEPS.length}
           onSkip={skipCoach}
           onNext={advanceCoach}
+          onPrev={goPrevCoach}
           compact={compact}
         />
       )}
       {showCoachComplete && (
         <TutorialCompleteModal
           onClose={() => {
-            const done = INTERACTIVE_STEPS.length + 1;
-            setCoachStep(done);
-            persistCoach(done);
-            // User asked for a fresh start after the tutorial — the
-            // practice grid is wiped so the actual run begins on a
-            // blank map with INITIAL_MONEY etc.
+            goToStep(INTERACTIVE_STEPS.length + 1);
+            // User asked for a fresh start after the tutorial — wipe the
+            // practice grid so the actual run begins on a blank map with
+            // INITIAL_MONEY etc.
             if (typeof onReset === 'function') onReset();
           }}
           compact={compact}
