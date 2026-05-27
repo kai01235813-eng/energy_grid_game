@@ -3724,10 +3724,10 @@ const INTERACTIVE_STEPS = [
       + '• 주파수 <b>60 Hz 위로 상승 → 충전</b> (잉여 흡수)<br/>'
       + '• 주파수 <b>60 Hz 아래로 하강 → 방전</b> (부족 보충)<br/>'
       + '변전소·전신주·데이터센터 옆에 두면 자동 작동합니다.<br/><br/>'
-      + '<b>지금 해보기</b>: <b>태양광 · 풍력 · ESS 중 하나</b>를 설치하세요. 설치 완료 시 자동으로 다음 단계로 넘어갑니다.'
+      + '<b>지금 해보기</b>: 6단계의 태양광은 이미 설치돼 있습니다. <b>풍력 + ESS</b>를 한 기씩 추가하세요. 세 가지(태양광·풍력·ESS)가 모두 갖춰지면 자동으로 다음 단계.'
     ),
     info: true,
-    requiresOneOf: ['solar', 'wind', 'ess'],
+    requiresAll: ['solar', 'wind', 'ess'],
   },
   {
     icon: '🐦',
@@ -4296,6 +4296,13 @@ function UI({
   // Per-step "we already triggered the demo event" latch so we don't keep
   // spawning a new crow every render while the player figures out the step.
   const tutorialEventSpawnedRef = useRef({});
+  // Per-step "events array has confirmed the demo event is live" latch.
+  // Separate from spawnedRef because setEvents is async — the auto-advance
+  // useEffect that runs in the SAME render as the spawn would otherwise
+  // see {ref=true, events=stale empty} and falsely decide the event was
+  // already resolved, cascading through every fault step. activeRef flips
+  // true only AFTER events has propagated the spawn.
+  const tutorialEventActiveRef = useRef({});
   const goToStep = (next) => {
     if (next > coachHighWaterRef.current) coachHighWaterRef.current = next;
     setCoachStep(next);
@@ -4318,6 +4325,20 @@ function UI({
     const ok = onSpawnTutorialEvent(def.requiresEventType);
     if (ok) tutorialEventSpawnedRef.current[coachStep] = true;
   }, [coachStep, onSpawnTutorialEvent]);
+
+  // Flip activeRef[step] to true ONLY when events actually contains the
+  // spawned demo event. This is the load-bearing fix for the race where
+  // spawn + auto-advance ran in the same render — auto-advance would see
+  // spawnedRef=true but events still empty (stale closure), conclude
+  // "already resolved", and skip the step. With activeRef, we require
+  // visual confirmation before the resolved check can fire.
+  useEffect(() => {
+    if (coachStep < 0 || coachStep >= INTERACTIVE_STEPS.length) return;
+    const def = INTERACTIVE_STEPS[coachStep];
+    if (!def || !def.requiresEventType) return;
+    const isActive = (events || []).some((e) => e.type === def.requiresEventType);
+    if (isActive) tutorialEventActiveRef.current[coachStep] = true;
+  }, [coachStep, events]);
 
   // Auto-advance when the current step's requirement is met. Logic per
   // requirement type:
@@ -4345,11 +4366,16 @@ function UI({
       for (const [, b] of buildings) {
         if (def.requiresOneOf.indexOf(b.type) !== -1) { done = true; break; }
       }
+    } else if (def.requiresAll) {
+      hasReq = true;
+      const need = new Set(def.requiresAll);
+      for (const [, b] of buildings) need.delete(b.type);
+      done = need.size === 0;
     } else if (def.requiresEventType) {
       hasReq = true;
-      // Only count as done if the event was actually spawned for this
-      // step (otherwise day-zero of the step would auto-skip).
-      if (tutorialEventSpawnedRef.current[coachStep]) {
+      // Only count as done if the event was ACTUALLY seen as active at
+      // some point — guarantees we don't skip due to a same-render race.
+      if (tutorialEventActiveRef.current[coachStep]) {
         const stillActive = (events || []).some((e) => e.type === def.requiresEventType);
         done = !stillActive;
       }
