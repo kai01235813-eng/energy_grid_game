@@ -28,3 +28,30 @@
   60% { opacity: 1; transform: translate(-50%, 0) scale(1.03); }
   100% { opacity: 1; transform: translate(-50%, 0) scale(1); }
 }
+
+/* ────────── Mobile rotate-device gate ──────────
+ * The 3D grid builder, HUD, and palette are designed for landscape. On a
+ * narrow portrait screen most of the UI clips. We cover the viewport with a
+ * "rotate your phone" prompt whenever the device is small (<= 900px) AND
+ * portrait. The overlay is rendered unconditionally by React; CSS decides
+ * whether to show it, so the layout fixes itself instantly when the user
+ * rotates without needing a JS resize listener. */
+.eg-rotate-overlay {
+  display: none;
+}
+@media (orientation: portrait) and (max-width: 900px) {
+  .eg-rotate-overlay {
+    display: flex;
+    position: fixed;
+    inset: 0;
+    z-index: 100000;
+    background: radial-gradient(circle at 50% 40%, #0a1a3a 0%, #050816 70%);
+    color: #e6f7ff;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    padding: 28px;
+    text-align: center;
+    font-family: system-ui, -apple-system, sans-serif;
+  }
+}

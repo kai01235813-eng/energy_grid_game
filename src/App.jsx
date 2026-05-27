@@ -4,6 +4,25 @@ import GridBuilder3D from './components/GridBuilder3D';
 import EducationMode from './components/EducationMode';
 import ErrorBoundary from './components/ErrorBoundary';
 
+// Mobile portrait is hostile to this UI — HUD panels and the bottom palette
+// assume a wide viewport. CSS-driven overlay (no JS resize listener needed)
+// renders only when the device is small AND in portrait. Class lives in
+// index.css so the same rule applies regardless of which mode is loaded.
+function RotateDevicePrompt() {
+  return (
+    <div className="eg-rotate-overlay" aria-hidden="true">
+      <div style={{ fontSize: 64, marginBottom: 16 }}>📱↻</div>
+      <h2 style={{ color: '#00d4ff', fontFamily: 'system-ui', margin: '0 0 8px' }}>
+        가로 모드로 회전해 주세요
+      </h2>
+      <p style={{ color: '#7aa', fontFamily: 'system-ui', fontSize: 13, lineHeight: 1.6, maxWidth: 280 }}>
+        Energy Grid는 가로 화면 기준으로 설계되어 있습니다.<br />
+        기기를 옆으로 돌리면 정상적으로 표시됩니다.
+      </p>
+    </div>
+  );
+}
+
 function App() {
   const [mode, setMode] = useState(() => {
     return localStorage.getItem('eg_mode') || 'menu';
@@ -15,7 +34,12 @@ function App() {
   };
 
   if (mode === 'menu') {
-    return <ModeSelect onSelect={switchMode} />;
+    return (
+      <>
+        <ModeSelect onSelect={switchMode} />
+        <RotateDevicePrompt />
+      </>
+    );
   }
 
   return (
@@ -43,6 +67,7 @@ function App() {
         {mode === 'phaser' && <SmartGridGame />}
         {mode === 'r3f' && <GridBuilder3D />}
         {mode === 'edu' && <EducationMode />}
+        <RotateDevicePrompt />
       </div>
     </ErrorBoundary>
   );

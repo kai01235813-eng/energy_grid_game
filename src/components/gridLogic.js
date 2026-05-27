@@ -384,44 +384,80 @@ export function applyEssDynamics(essKeys, state, imbalance, dt) {
   return net;
 }
 
-// Connection rules — mirror real-world Korean grid topology:
+// Connection rules — mirror real-world Korean grid topology with one extra
+// nuance: renewables behave differently by scale.
 //
-//   [발전소 / 신재생단지]
+//   [대규모 신재생 단지 ≥3기]
 //        │  154 kV 송전선 (철탑)
 //        ▼
-//   [민자 변전소 — M.Tr 승압]
-//        │  154 kV
-//        ▼
-//   [공용 변전소]  ◀── ESS (변전소 부지 내 BESS)
-//        │  22.9 kV 변압
+//   [민자 변전소 → 한전 공용 변전소]
+//        │
 //        ▼
 //   [전신주 → 전신주 → 가정/마을]
-//   [공장/데이터센터: 154 kV 전용선 직결]
 //
-// 결과적으로 같은 tier끼리만 잇고, transformer(변전소)가 고-저압의 유일한
-// 가교가 됩니다. 발전기-발전기, 소비처-소비처 직결은 모두 불허.
-export function canConnect(typeA, typeB) {
+//   [소·중규모 신재생 1~2기, 옥상 PV·소형 풍력]
+//        │  22.9 kV 또는 220 V
+//        ▼  (전신주·가정 직결)
+//   [전신주 → 가정/마을]
+//
+// Result: same-voltage links + substation as the only high↔low bridge,
+// PLUS a small-scale shortcut for distributed renewables. Generators and
+// consumers still can't bus directly to themselves.
+const ESS_ALLOWED_TARGETS = new Set([
+  'substation',     // 변전소 부지 BESS (largest deployment pattern)
+  'utilityPole',    // 배전 말단 피크 저감용 (distributed energy storage)
+  'dataCenter',     // 대규모 부하 평탄화 / UPS 역할
+]);
+const RENEW_LARGE_CLUSTER_THRESHOLD = 3;
+
+// Hex-distance count of solar+wind buildings within radius 2 of (q, r),
+// INCLUDING the building at the origin. Used to classify a renewable as
+// small/medium (1-2) vs large cluster (3+).
+export function renewableClusterCount(q, r, buildings) {
+  let n = 0;
+  for (const [, b] of buildings) {
+    if (b.type !== 'solar' && b.type !== 'wind') continue;
+    if (hexDistance(q, r, b.q, b.r) <= 2) n++;
+  }
+  return n;
+}
+
+// Build a map of { renewableKey → clusterSize } in one pass — saves the
+// inner canConnect calls from re-scanning every other renewable each time.
+export function buildRenewableClusterMap(buildings) {
+  const m = new Map();
+  for (const [k, b] of buildings) {
+    if (b.type !== 'solar' && b.type !== 'wind') continue;
+    m.set(k, renewableClusterCount(b.q, b.r, buildings));
+  }
+  return m;
+}
+
+export function canConnect(typeA, typeB, ctx = null) {
   const a = TILE_TYPES[typeA];
   const b = TILE_TYPES[typeB];
   if (!a || !b) return false;
   // 1) Generators do not bus to each other directly — they tie into the
-  //    grid through a substation or transmission tower. Without this, two
-  //    adjacent sources (solar + wind, solar + powerPlant) would form a
-  //    closed 2-node island with no load.
+  //    grid through a substation or transmission tower.
   if ((a.supply || 0) > 0 && (b.supply || 0) > 0) return false;
-  // 2) Same logic on the load side: two consumers don't share a wire
-  //    directly — house↔house, factory↔factory, factory↔dataCenter all
-  //    need to go through 전신주/송전탑/변전소.
+  // 2) Same logic on the load side: two consumers don't share a wire.
   if ((a.demand || 0) > 0 && (b.demand || 0) > 0) return false;
-  // 3) ESS only attaches at a substation. Real utility-scale batteries
-  //    sit at substation POIs to share protection/metering/switchgear.
-  if (typeA === 'ess') return typeB === 'substation';
-  if (typeB === 'ess') return typeA === 'substation';
-  // 4) Otherwise: same voltage tier OR one side is the substation
-  //    (transformer) that bridges high↔low. This means a utility-scale
-  //    solar/wind farm MUST go through a substation (or 154 kV pylons) to
-  //    reach distribution — exactly the diagram above. There's no
-  //    renewable "shortcut" to a 전신주.
+  // 3) ESS endpoints: substation (BESS), utilityPole (배전 말단 피크 저감),
+  //    dataCenter (대규모 부하 평탄화).
+  if (typeA === 'ess') return ESS_ALLOWED_TARGETS.has(typeB);
+  if (typeB === 'ess') return ESS_ALLOWED_TARGETS.has(typeA);
+  // 4) Renewable scale shortcut — small/medium clusters (1~2기) can attach
+  //    directly to distribution (옥상 PV → 가정, 소형 풍력 → 전신주). Large
+  //    clusters (≥3기 단지) lose this shortcut and must go through a
+  //    substation or 154 kV pylon, matching real utility-scale practice.
+  const cluster = ctx && ctx.renewableClusterMap;
+  const aLarge = a.renewable && cluster
+    && (cluster.get(ctx.keyA) || 0) >= RENEW_LARGE_CLUSTER_THRESHOLD;
+  const bLarge = b.renewable && cluster
+    && (cluster.get(ctx.keyB) || 0) >= RENEW_LARGE_CLUSTER_THRESHOLD;
+  if (a.renewable && !aLarge && b.tier === 'distribution') return true;
+  if (b.renewable && !bLarge && a.tier === 'distribution') return true;
+  // 5) Standard tier rules — substation bridges, else same tier.
   if (a.tier === 'transformer' || b.tier === 'transformer') return true;
   return a.tier === b.tier;
 }
@@ -484,11 +520,15 @@ export function simulate(buildings, disabledKeys = null, disabledEdges = null, t
   // does NOT propagate power.
   const edges = [];
   const liveEdges = [];
+  // Precompute renewable cluster sizes once so canConnect can apply the
+  // small-vs-large scale rule in O(1) per pair instead of re-scanning.
+  const renewableClusterMap = buildRenewableClusterMap(buildings);
   for (let i = 0; i < entries.length; i++) {
     for (let j = i + 1; j < entries.length; j++) {
       const a = entries[i], b = entries[j];
       const d = hexDistance(a.q, a.r, b.q, b.r);
-      if (d > 0 && d <= Math.min(a.range, b.range) && canConnect(a.type, b.type)) {
+      const ctx = { keyA: a.key, keyB: b.key, renewableClusterMap };
+      if (d > 0 && d <= Math.min(a.range, b.range) && canConnect(a.type, b.type, ctx)) {
         edges.push([a.key, b.key]);
         if (!isEdgeDown(a.key, b.key)) liveEdges.push([a.key, b.key]);
       }
