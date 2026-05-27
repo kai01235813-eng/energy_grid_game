@@ -2358,8 +2358,16 @@ export default function GridBuilder3D() {
       // Low-pass toward target with time constant FREQ_SMOOTH_TAU. The visible
       // freq lags the math, which is more realistic (rotor inertia) AND gives
       // the player a moment to react before the gauge crosses a band.
+      // Defensive snap: with literally zero buildings the grid has no inertia
+      // to bleed off — pin to NOMINAL immediately so the gauge doesn't
+      // linger at 62 Hz after the player wipes everything (playtesters
+      // reported "다 지웠는데 주파수가 계속 떠 있어요").
       const lpKfreq = 1 - Math.exp(-dt / FREQ_SMOOTH_TAU);
-      freqRef.current += (targetFreq - freqRef.current) * lpKfreq;
+      if (buildingsRef.current.size === 0) {
+        freqRef.current = NOMINAL_FREQ;
+      } else {
+        freqRef.current += (targetFreq - freqRef.current) * lpKfreq;
+      }
       freqTargetRef.current = targetFreq;
       const freq = freqRef.current;
       const health = gridHealthFromFreq(freq);
@@ -3660,21 +3668,70 @@ const INTERACTIVE_STEPS = [
     info: true,
   },
   {
-    icon: '🚨',
-    title: '사고 대응 — 항목별 조치',
+    icon: '🐦',
+    title: '사고 대응 ① · 까마귀 트립',
     body: (
-      '플레이 중 다양한 사고 이벤트가 발생합니다. 각각 대응 방법이 다릅니다.<br/><br/>'
-      + '<b>🐦 까마귀 트립 (송전탑·전신주)</b><br/>'
-      + '해당 설비를 직접 <b>탭</b>해서 쫓아내세요. 9초 방치 시 자동 dismiss.<br/><br/>'
-      + '<b>🔥 산불 (송전탑)</b><br/>'
-      + '불타는 송전탑을 <b>탭</b>해 진화 헬기 투입. 방치 시 15초 후 자연 진화되지만 그동안 정전 + 사고 처리비 −₩300.<br/><br/>'
-      + '<b>⚡ 낙뢰 (송전탑)</b><br/>'
-      + '3초 후 자동 회복. 즉시 사고 처리비 −₩350만 차감 (클릭 불필요).<br/><br/>'
-      + '<b>🔧 선로 고장 · 🚁 헬기 추락 (송전선로)</b><br/>'
-      + '회선 위의 <b>⚠ 마커를 탭</b>하면 가장 가까운 변전소에서 복구반(작업자)이 출동 → 휴전 작업(5초) → 복구. 보호협조 덕분에 그리드 전체 정전은 막지만 사고 처리비는 차감됩니다.<br/><br/>'
-      + '<b>🚧 지장전주 (전신주 이설)</b><br/>'
-      + '<b>1) 콘 마커를 탭</b> → 인접 헥스에 <b>녹색 후광</b>이 뜸 → <b>2) 후광을 탭</b>해서 이설 완료. 케이스별 정산: 도로 확장 +₩500, 사유지 −₩150, 건축 +₩300. 28초 방치 시 강제 철거 + −₩400.<br/><br/>'
-      + '<b>예방책</b>: 송전탑↔송전탑 회선의 가운데 점을 클릭해 <b>이중화(N-1)</b>하면 그쪽 사고가 나도 부하절체로 무중단 운영됩니다.'
+      '<b>발생 위치</b>: 송전탑·전신주 (전신주에 4배 자주 — 22.9 kV 배전선에 까마귀가 많음)<br/>'
+      + '<b>피해</b>: 해당 설비가 9초간 작동 불능 → 다운스트림 정전 가능<br/>'
+      + '<b>조치</b>: 까마귀가 보이는 설비를 직접 <b>탭</b>해서 쫓기.<br/>'
+      + '<b>방치 시</b>: 9초 후 자동 dismiss (정전 동안 점등된 가정 수익 손실)'
+    ),
+    info: true,
+  },
+  {
+    icon: '🔥',
+    title: '사고 대응 ② · 산불',
+    body: (
+      '<b>발생 위치</b>: 송전탑 1기<br/>'
+      + '<b>피해</b>: 절연 파괴로 송전탑이 15초간 작동 불능 + 사고 처리비 즉시 <b>−₩300</b><br/>'
+      + '<b>조치</b>: 불타는 송전탑을 <b>탭</b>해 진화 헬기 투입.<br/>'
+      + '<b>방치 시</b>: 15초 후 자연 진화. 그동안 다운스트림 정전 + 정전 드레인 추가'
+    ),
+    info: true,
+  },
+  {
+    icon: '⚡',
+    title: '사고 대응 ③ · 낙뢰',
+    body: (
+      '<b>발생 위치</b>: 송전탑 1기<br/>'
+      + '<b>피해</b>: 3초간 즉시 트립 + 즉시 사고 처리비 <b>−₩350</b><br/>'
+      + '<b>조치</b>: 자동 회복. 클릭으로 막을 수 없음 — "운"의 영역.<br/>'
+      + '<b>예방</b>: 핵심 송전 백본을 이중화하면 다운스트림 정전을 막을 수 있음'
+    ),
+    info: true,
+  },
+  {
+    icon: '🔧',
+    title: '사고 대응 ④ · 설비 고장 (선로 고장)',
+    body: (
+      '<b>발생 위치</b>: 모든 전력 회선<br/>'
+      + '<b>피해</b>: 즉시 <b>−₩200</b> + 정전 소비처가 있으면 지속 드레인 (보호협조로 그리드 전체 정전은 막힘)<br/>'
+      + '<b>조치</b>: 회선 위의 <b>⚠ 마커를 탭</b> → 가장 가까운 변전소에서 복구반(안전모 작업자) 출동 → 휴전 작업 5초 → 복구.<br/>'
+      + '<b>예방</b>: 송전탑↔송전탑 회선의 가운데 점 클릭으로 <b>이중화(N-1)</b> → 부하절체 무중단'
+    ),
+    info: true,
+  },
+  {
+    icon: '🚁',
+    title: '사고 대응 ⑤ · 헬기 추락',
+    body: (
+      '<b>발생 위치</b>: 송전탑↔송전탑 154 kV 백본 회선 (낮은 비행 점검·수송 헬기 접촉)<br/>'
+      + '<b>피해</b>: 즉시 <b>−₩500</b> (게임 내 가장 비싼 사고) + 검은 연기 시각화<br/>'
+      + '<b>조치</b>: 선로 고장과 동일 — <b>⚠ 마커를 탭</b>해 복구반 출동.<br/>'
+      + '<b>특징</b>: 빈도는 낮지만 회복 안 하면 사고 처리비가 너무 큼. 우선 대응'
+    ),
+    info: true,
+  },
+  {
+    icon: '🚧',
+    title: '사고 대응 ⑥ · 지장전주 이설',
+    body: (
+      '<b>발생 위치</b>: 기존 전신주 1기 (현실 사유: 도로 확장·사유지 재산권·건축 진출입)<br/>'
+      + '<b>피해</b>: 28초 안에 이설 안 하면 강제 철거 + <b>−₩400</b> + 다운스트림 정전<br/>'
+      + '<b>조치 (2단계)</b>:<br/>'
+      + '&nbsp;&nbsp;1) 콘 모양 마커를 <b>탭</b> → 주변 인접 헥스에 <b>녹색 후광</b> 표시<br/>'
+      + '&nbsp;&nbsp;2) 녹색 후광 헥스를 <b>탭</b> → 전신주 이설 완료<br/>'
+      + '<b>케이스별 정산</b>: 🛣 도로 확장 <b>+₩500</b>, 🏠 사유지 <b>−₩150</b>, 🚗 건축 <b>+₩300</b>'
     ),
     info: true,
   },

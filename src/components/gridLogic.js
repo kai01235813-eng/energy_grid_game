@@ -326,14 +326,24 @@ export function renewableFactor(kind, t) {
 }
 
 // Smart inverters trim output when supply outruns demand to keep freq down.
-// Returns a multiplier in [0.25, 1]. The further supply exceeds demand, the
-// harder the trim.
+// Returns a multiplier in [0, 1].
+//   • effDemand <= 0 (literally no load on the grid): trim to 0. A real
+//     smart-inverter sees no load and shuts down. Without this, an isolated
+//     solar/wind farm with no consumers would still push enough power to
+//     drive freq to 62 Hz — the symptom playtesters reported as "혼자 태양광
+//     지으면 주파수가 계속 올라가요".
+//   • supply slightly above demand: no curtailment (5 % grace band).
+//   • supply moderately above demand: linear ramp down to 60 % at +50 % over.
+//   • supply ≥ 1.5× demand: floor at 25 % (never fully disconnect a
+//     generator that's still feeding actual load — real engineers like
+//     keeping spinning reserve online).
 export function curtailFactor(supply, effDemand) {
+  if (effDemand <= 0) return 0;
   if (supply <= effDemand) return 1;
   const over = (supply - effDemand) / Math.max(effDemand, 1);
-  if (over < 0.05) return 1;       // small margin — no curtailment
+  if (over < 0.05) return 1;
   if (over < 0.5) return 1 - over * 0.8;
-  return 0.25;                     // floor — never throttle below 25 %
+  return 0.25;
 }
 
 // ESS auto-charge/discharge. Mutates the state Map in place to avoid
@@ -837,7 +847,7 @@ export const EVENT_DEFS = {
     emoji: '🐦',
     color: '#cdb8ff',
     duration: 9,
-    weight: 5,
+    weight: 3,
     pickTarget(buildings) {
       // Crows perch on both pylons (송전탑) and utility poles (전신주), but
       // 22.9 kV distribution poles are far more common around towns and
@@ -866,7 +876,7 @@ export const EVENT_DEFS = {
     emoji: '🔥',
     color: '#ff5818',
     duration: 15,
-    weight: 2,
+    weight: 3,
     pickTarget(buildings) {
       const pool = [...buildings.entries()].filter(([, b]) => b.type === 'pylon');
       if (pool.length === 0) return null;
@@ -878,7 +888,7 @@ export const EVENT_DEFS = {
     emoji: '⚡',
     color: '#fff080',
     duration: 3,
-    weight: 1,
+    weight: 3,
     pickTarget(buildings) {
       const pool = [...buildings.entries()].filter(([, b]) => b.type === 'pylon');
       if (pool.length === 0) return null;
@@ -916,7 +926,7 @@ export const EVENT_DEFS = {
     emoji: '🚁',
     color: '#ff3050',
     duration: 90,
-    weight: 1,
+    weight: 3,
     targetKind: 'edge',
     pickTarget(buildings, edges) {
       if (!edges || edges.length === 0) return null;
