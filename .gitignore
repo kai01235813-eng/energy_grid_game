@@ -38,3 +38,7 @@ coverage/
 
 # Claude Code local settings
 .claude/
+
+# Kenney asset reference downloads — only the subset copied into public/ ships
+kenney_*.zip
+kenney_*/

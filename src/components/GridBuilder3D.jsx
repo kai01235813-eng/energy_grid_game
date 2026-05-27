@@ -1,0 +1,3530 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Canvas, useFrame } from '@react-three/fiber';
+import { OrbitControls, Line } from '@react-three/drei';
+import * as THREE from 'three';
+import {
+  HEX_R, hexToWorld, hexKey, edgeKey, hexDistance,
+  generateMap, TILE_TYPES, BUILDING_KEYS, TRADITIONAL_KEYS, SMART_GRID_KEYS, SPECIAL_KEYS, simulate,
+  demandMultiplier, computeFrequency, gridHealthFromFreq, freqStatus,
+  NOMINAL_FREQ, SAFE_BAND, FREQ_MAX_DEV,
+  EXPANSION_MILESTONES, INITIAL_RADIUS, MAX_RADIUS, radiusForScore,
+  EVENT_DEFS, nextEventId, pickRandomEvent,
+  WIND_SUPPLY_MULT,
+  TERRAIN_INFO, canBuildOn,
+  landValueAt, buildCost, INITIAL_MONEY, INCOME_PER_MWH,
+  nimbyMultiplier,
+  edgeUpgradeCost, REDUNDANCY_REFUND, FREQ_SMOOTH_TAU,
+  renewableFactor, curtailFactor, applyEssDynamics,
+  dataCenterStatus,
+} from './gridLogic';
+import RepairWorker from './RepairWorker';
+
+// ───────────────── Shared materials ─────────────────
+// Lambert is ~3x cheaper per fragment than meshStandardMaterial's PBR.
+// One material instance per role means WebGL only swaps state when actually
+// changing material, not on every mesh. Emissive bits use MeshBasicMaterial
+// — they need no shading; pure color is the cheapest shader.
+const MAT = {
+  steel:     new THREE.MeshLambertMaterial({ color: '#4a5872' }),
+  steelDk:   new THREE.MeshLambertMaterial({ color: '#3a4452' }),
+  concrete:  new THREE.MeshLambertMaterial({ color: '#4d5868' }),
+  cool:      new THREE.MeshLambertMaterial({ color: '#5a6678' }),
+  wood:      new THREE.MeshLambertMaterial({ color: '#8b6a44' }),
+  plaster:   new THREE.MeshLambertMaterial({ color: '#e6cba0' }),
+  roof:      new THREE.MeshLambertMaterial({ color: '#b86464' }),
+  factory:   new THREE.MeshLambertMaterial({ color: '#7a8290' }),
+  factoryDk: new THREE.MeshLambertMaterial({ color: '#444c5a' }),
+  soil:      new THREE.MeshLambertMaterial({ color: '#3a2d22' }),
+};
+
+// ───────────────── Hex grid (InstancedMesh — 1 draw call) ─────────────────
+// Hex base lives entirely in one instanced mesh. To get the "warm bloom"
+// feeling without ANY dynamic point lights, we tint hex instance colors
+// whenever a powered consumer/source is nearby — the *ground itself* glows
+// warm. CPU cost: O(hexes) once per building/event change. GPU cost: zero.
+const _dummy = new THREE.Object3D();
+const _color = new THREE.Color();
+const COLOR_NORMAL    = new THREE.Color('#212d46');
+const COLOR_HAS_BLD   = new THREE.Color('#2e3d5a');
+const COLOR_WARM      = new THREE.Color('#7a5236'); // very subtle warm tint — the bulk of the "lit" feeling comes from atmospheric ambient warming, not from the ground tile itself (player asked: ground-brightening is uncomfortable)
+const COLOR_RIVER     = new THREE.Color('#244a72');
+const COLOR_MOUNTAIN  = new THREE.Color('#2e4a2a'); // mossy forest-mountain base — Korean mountains read as 녹산, not bare rock
+const COLOR_FOREST    = new THREE.Color('#2a3b3e'); // mossy floor
+const COLOR_LV_HIGH   = new THREE.Color('#6a4a3a'); // affluent (warm earth)
+const COLOR_LV_LOW    = new THREE.Color('#1b2740'); // cheap outskirts (cool)
+
+function hexAxialDistance(q1, r1, q2, r2) {
+  return (Math.abs(q1 - q2) + Math.abs(r1 - r2) + Math.abs(q1 + r1 - q2 - r2)) / 2;
+}
+
+// Maximum hex count we'll ever need — sized for MAX_RADIUS. Pre-allocating
+// the InstancedMesh buffer at this capacity (instead of growing it as the
+// map expands) avoids the bug where new tiles past the original capacity
+// would not raycast: R3F won't always grow an existing InstancedMesh's
+// per-instance buffer when `args` changes, so the new tiles would render
+// at identity (origin) and clicks beyond the original count would fail.
+const MAX_TILES = 3 * MAX_RADIUS * (MAX_RADIUS + 1) + 1;
+
+function HexGrid({ tiles, buildings, buildingsKeys, powered, landValueByKey, onTileClick, onHover, onLeave }) {
+  const ref = useRef();
+
+  // (re)position when tile set changes — river hexes sink to look like water
+  useEffect(() => {
+    if (!ref.current) return;
+    for (let i = 0; i < tiles.length; i++) {
+      const t = tiles[i];
+      const [x, , z] = hexToWorld(t.q, t.r);
+      const y = t.terrain === 'river' ? -0.42 : -0.28;
+      _dummy.position.set(x, y, z);
+      _dummy.updateMatrix();
+      ref.current.setMatrixAt(i, _dummy.matrix);
+    }
+    ref.current.instanceMatrix.needsUpdate = true;
+    ref.current.count = tiles.length;
+  }, [tiles]);
+
+  // (re)color when buildings/powered/landValue changes — bakes both the
+  // warmth field (powered glow) and the land-value tint (subtle wealth
+  // indicator on plain land only) into per-instance colors.
+  useEffect(() => {
+    if (!ref.current) return;
+    // Warmth: range glow around powered consumers/sources. Defensive against
+    // buildings/powered being passed as undefined (during initial mount).
+    const warmth = new Map();
+    if (buildings && powered) {
+      for (const [bk, b] of buildings) {
+        if (!powered[bk]) continue;
+        const def = TILE_TYPES[b.type];
+        const consumer = (def.demand || 0) > 0;
+        const source = (def.supply || 0) > 0;
+        if (!consumer && !source) continue;
+        const radius = consumer ? 2 : 1;
+        const peak = consumer ? 0.45 : 0.25;
+        for (let dq = -radius; dq <= radius; dq++) {
+          for (let dr = -radius; dr <= radius; dr++) {
+            if (Math.abs(dq + dr) > radius) continue;
+            const dist = (Math.abs(dq) + Math.abs(dr) + Math.abs(dq + dr)) / 2;
+            const w = peak * (1 - dist / (radius + 1));
+            const k = hexKey(b.q + dq, b.r + dr);
+            if (w > (warmth.get(k) || 0)) warmth.set(k, w);
+          }
+        }
+      }
+    }
+
+    for (let i = 0; i < tiles.length; i++) {
+      const t = tiles[i];
+      const k = hexKey(t.q, t.r);
+
+      // Terrain bases take precedence — they don't get warmth/landValue tint.
+      if (t.terrain === 'river') {
+        ref.current.setColorAt(i, COLOR_RIVER);
+        continue;
+      }
+      if (t.terrain === 'mountain') {
+        ref.current.setColorAt(i, COLOR_MOUNTAIN);
+        continue;
+      }
+      if (t.terrain === 'forest') {
+        ref.current.setColorAt(i, COLOR_FOREST);
+        continue;
+      }
+
+      // Plain land: blend base → landValue tint → warmth.
+      const base = buildingsKeys && buildingsKeys.has(k) ? COLOR_HAS_BLD : COLOR_NORMAL;
+      _color.copy(base);
+      if (landValueByKey) {
+        const lv = landValueByKey.get(k);
+        if (lv != null) {
+          // Map 30..90 → -1..+1 toward LV_LOW/LV_HIGH. Subtle: max 0.18 lerp.
+          const norm = Math.max(-1, Math.min(1, (lv - 60) / 30));
+          const target = norm >= 0 ? COLOR_LV_HIGH : COLOR_LV_LOW;
+          _color.lerp(target, Math.abs(norm) * 0.18);
+        }
+      }
+      const w = warmth.get(k) || 0;
+      if (w > 0) _color.lerp(COLOR_WARM, w);
+      ref.current.setColorAt(i, _color);
+    }
+    if (ref.current.instanceColor) ref.current.instanceColor.needsUpdate = true;
+  }, [tiles, buildings, buildingsKeys, powered, landValueByKey]);
+
+  return (
+    <instancedMesh
+      ref={ref}
+      args={[undefined, undefined, MAX_TILES]}
+      onClick={(e) => {
+        e.stopPropagation();
+        const i = e.instanceId;
+        if (i == null || !tiles[i]) return;
+        onTileClick(tiles[i].q, tiles[i].r);
+      }}
+      onPointerMove={(e) => {
+        e.stopPropagation();
+        const i = e.instanceId;
+        if (i == null || !tiles[i]) return;
+        onHover(hexKey(tiles[i].q, tiles[i].r));
+      }}
+      onPointerOut={() => onLeave()}
+    >
+      <cylinderGeometry args={[HEX_R, HEX_R, 0.56, 6]} />
+      <meshLambertMaterial />
+    </instancedMesh>
+  );
+}
+
+function HoverRing({ hovered }) {
+  if (!hovered) return null;
+  const [qs, rs] = hovered.split(',');
+  const [x, , z] = hexToWorld(parseInt(qs, 10), parseInt(rs, 10));
+  return (
+    <mesh position={[x, 0.01, z]} rotation={[-Math.PI / 2, 0, 0]}>
+      <ringGeometry args={[HEX_R * 0.85, HEX_R * 0.96, 6]} />
+      <meshBasicMaterial color="#ffd86b" transparent opacity={0.85} />
+    </mesh>
+  );
+}
+
+// Real ground beneath the hex grid. Single flat disc — cheap, opaque, looks
+// like soil. The hexes' own thick prism sides hide the seam where they sit.
+function LandFloor({ mapRadius }) {
+  const radius = (mapRadius + 2) * Math.sqrt(3) * HEX_R + 4;
+  return (
+    <mesh position={[0, -0.6, 0]} rotation={[-Math.PI / 2, 0, 0]} material={MAT.soil}>
+      <circleGeometry args={[radius, 24]} />
+    </mesh>
+  );
+}
+
+// ───────────────── Terrain layer (산 · 숲) ─────────────────
+// Two pairs of InstancedMesh objects — stone+snow for mountains, trunk+leaf
+// for trees. River tiles are rendered implicitly by HexGrid (lowered y + blue
+// color). Terrain meshes have raycast disabled so clicks fall through to the
+// hex below, where the buildability check lives.
+const TERRAIN_MAT = {
+  // Korean mountains are predominantly forested (녹산), not bare rock. The
+  // "stone" cone is now a deeper-green wooded slope, and the "snow" cap is a
+  // lighter green-yellow ridge — keeps the two-tone silhouette while losing
+  // the alpine look.
+  mountainStone: new THREE.MeshLambertMaterial({ color: '#3a6634' }),
+  mountainSnow:  new THREE.MeshLambertMaterial({ color: '#6fa05a' }),
+  treeFoliage:   new THREE.MeshLambertMaterial({ color: '#3d6a3a' }),
+  treeTrunk:     new THREE.MeshLambertMaterial({ color: '#5c4530' }),
+};
+
+const TREES_PER_FOREST = 3;
+const FOREST_OFFSETS = [
+  [-0.34, -0.22],
+  [ 0.30, -0.26],
+  [ 0.02,  0.32],
+];
+
+function _terrainHash(q, r, k = 0) {
+  let h = (q * 374761393 + r * 668265263 + k * 1442695040) | 0;
+  h = (h ^ (h >>> 13)) * 1274126177;
+  h = (h ^ (h >>> 16)) | 0;
+  return ((h >>> 0) % 100000) / 100000;
+}
+
+const _noRaycast = () => {};
+
+function TerrainLayer({ tiles }) {
+  const stoneRef = useRef();
+  const snowRef = useRef();
+  const trunkRef = useRef();
+  const leafRef = useRef();
+
+  const counts = useMemo(() => {
+    let mountain = 0, forest = 0;
+    for (const t of tiles) {
+      if (t.terrain === 'mountain') mountain++;
+      else if (t.terrain === 'forest') forest++;
+    }
+    return { mountain, tree: forest * TREES_PER_FOREST };
+  }, [tiles]);
+
+  useEffect(() => {
+    if (!stoneRef.current || !snowRef.current) return;
+    let i = 0;
+    for (const t of tiles) {
+      if (t.terrain !== 'mountain') continue;
+      const [x, , z] = hexToWorld(t.q, t.r);
+      const h = _terrainHash(t.q, t.r);
+      const scale = 0.85 + h * 0.55;
+      const rot = h * Math.PI * 2;
+      _dummy.position.set(x, 0.55 * scale, z);
+      _dummy.rotation.set(0, rot, 0);
+      _dummy.scale.set(scale, scale, scale);
+      _dummy.updateMatrix();
+      stoneRef.current.setMatrixAt(i, _dummy.matrix);
+      _dummy.position.set(x, 0.95 * scale, z);
+      _dummy.scale.set(scale * 0.42, scale * 0.42, scale * 0.42);
+      _dummy.updateMatrix();
+      snowRef.current.setMatrixAt(i, _dummy.matrix);
+      i++;
+    }
+    stoneRef.current.count = i;
+    snowRef.current.count = i;
+    stoneRef.current.instanceMatrix.needsUpdate = true;
+    snowRef.current.instanceMatrix.needsUpdate = true;
+  }, [tiles, counts.mountain]);
+
+  useEffect(() => {
+    if (!trunkRef.current || !leafRef.current) return;
+    let i = 0;
+    for (const t of tiles) {
+      if (t.terrain !== 'forest') continue;
+      const [x, , z] = hexToWorld(t.q, t.r);
+      for (let k = 0; k < TREES_PER_FOREST; k++) {
+        const h = _terrainHash(t.q, t.r, k + 1);
+        const scale = 0.7 + h * 0.55;
+        const [ox, oz] = FOREST_OFFSETS[k];
+        const jitter = (_terrainHash(t.q + 1, t.r + 1, k) - 0.5) * 0.12;
+        _dummy.position.set(x + ox + jitter, 0.15 * scale, z + oz + jitter);
+        _dummy.rotation.set(0, h * Math.PI * 2, 0);
+        _dummy.scale.set(scale, scale, scale);
+        _dummy.updateMatrix();
+        trunkRef.current.setMatrixAt(i, _dummy.matrix);
+        _dummy.position.set(x + ox + jitter, 0.55 * scale, z + oz + jitter);
+        _dummy.scale.set(scale, scale * 1.2, scale);
+        _dummy.updateMatrix();
+        leafRef.current.setMatrixAt(i, _dummy.matrix);
+        i++;
+      }
+    }
+    trunkRef.current.count = i;
+    leafRef.current.count = i;
+    trunkRef.current.instanceMatrix.needsUpdate = true;
+    leafRef.current.instanceMatrix.needsUpdate = true;
+  }, [tiles, counts.tree]);
+
+  // Capacity is fixed at the absolute upper bound (every tile a mountain,
+  // every tile a 3-tree forest) so the buffers never need to grow when the
+  // map expands. The per-mesh `.count` controls what's actually rendered.
+  const capMountain = MAX_TILES;
+  const capTree = MAX_TILES * TREES_PER_FOREST;
+
+  return (
+    <>
+      <instancedMesh
+        ref={stoneRef}
+        args={[undefined, TERRAIN_MAT.mountainStone, capMountain]}
+        raycast={_noRaycast}
+        frustumCulled={false}
+      >
+        <coneGeometry args={[0.62, 1.1, 5]} />
+      </instancedMesh>
+      <instancedMesh
+        ref={snowRef}
+        args={[undefined, TERRAIN_MAT.mountainSnow, capMountain]}
+        raycast={_noRaycast}
+        frustumCulled={false}
+      >
+        <coneGeometry args={[0.5, 0.45, 5]} />
+      </instancedMesh>
+      <instancedMesh
+        ref={trunkRef}
+        args={[undefined, TERRAIN_MAT.treeTrunk, capTree]}
+        raycast={_noRaycast}
+        frustumCulled={false}
+      >
+        <cylinderGeometry args={[0.05, 0.07, 0.3, 5]} />
+      </instancedMesh>
+      <instancedMesh
+        ref={leafRef}
+        args={[undefined, TERRAIN_MAT.treeFoliage, capTree]}
+        raycast={_noRaycast}
+        frustumCulled={false}
+      >
+        <coneGeometry args={[0.22, 0.55, 5]} />
+      </instancedMesh>
+    </>
+  );
+}
+
+// ───────────────── Building meshes (simplified) ─────────────────
+// Each role kept under ~6 sub-meshes. Solid surfaces share Lambert from MAT.
+// Emissive parts (glowing caps/windows) use Basic with a power-modulated
+// color — cheapest possible shader, no light eval at all.
+
+function makeGlowColor(baseHex, emissAmount) {
+  // Lerp from dim base toward bright base for the "powered" feel.
+  // emissAmount roughly in [0, 2.5]; >1 saturates the channel.
+  const c = new THREE.Color(baseHex);
+  const a = Math.min(1, emissAmount);
+  return c.multiplyScalar(0.3 + a * 0.7).getStyle();
+}
+
+function PowerPlantMesh({ powered, health, pulse = 1 }) {
+  const emiss = powered ? (0.6 + health * 1.4) * pulse : 0;
+  const capColor = makeGlowColor('#ffb84d', emiss);
+  return (
+    <group>
+      {/* base block */}
+      <mesh position={[0, 0.3, 0]} material={MAT.concrete}>
+        <boxGeometry args={[1.2, 0.6, 0.85]} />
+      </mesh>
+      {/* two cooling towers — closed cylinders, no double-sided */}
+      <mesh position={[-0.32, 0.95, 0.05]} material={MAT.cool}>
+        <cylinderGeometry args={[0.26, 0.34, 0.7, 8]} />
+      </mesh>
+      <mesh position={[0.32, 0.95, 0.05]} material={MAT.cool}>
+        <cylinderGeometry args={[0.26, 0.34, 0.7, 8]} />
+      </mesh>
+      {/* glowing tops — single combined ring per tower */}
+      <mesh position={[-0.32, 1.32, 0.05]}>
+        <cylinderGeometry args={[0.26, 0.26, 0.04, 8]} />
+        <meshBasicMaterial color={capColor} />
+      </mesh>
+      <mesh position={[0.32, 1.32, 0.05]}>
+        <cylinderGeometry args={[0.26, 0.26, 0.04, 8]} />
+        <meshBasicMaterial color={capColor} />
+      </mesh>
+    </group>
+  );
+}
+
+function SubstationMesh({ powered, health, pulse = 1 }) {
+  const emiss = powered ? (0.7 + health * 1.6) * pulse : 0;
+  const glow = makeGlowColor('#7be6ff', emiss);
+  return (
+    <group>
+      {/* platform */}
+      <mesh position={[0, 0.06, 0]} material={MAT.steel}>
+        <boxGeometry args={[1.3, 0.12, 1.3]} />
+      </mesh>
+      {/* single transformer bank — one wide box, 2 glowing bushings on top */}
+      <mesh position={[0, 0.36, 0]} material={MAT.steelDk}>
+        <boxGeometry args={[0.9, 0.5, 0.55]} />
+      </mesh>
+      <mesh position={[-0.25, 0.7, 0]}>
+        <sphereGeometry args={[0.09, 6, 5]} />
+        <meshBasicMaterial color={glow} />
+      </mesh>
+      <mesh position={[0.25, 0.7, 0]}>
+        <sphereGeometry args={[0.09, 6, 5]} />
+        <meshBasicMaterial color={glow} />
+      </mesh>
+      {/* lightning rod */}
+      <mesh position={[0, 1.0, 0.3]} material={MAT.steel}>
+        <cylinderGeometry args={[0.025, 0.025, 1.2, 5]} />
+      </mesh>
+      <mesh position={[0, 1.65, 0.3]}>
+        <coneGeometry args={[0.05, 0.12, 6]} />
+        <meshBasicMaterial color={glow} />
+      </mesh>
+    </group>
+  );
+}
+
+function PylonMesh({ powered, health, pulse = 1 }) {
+  // Pylon as a tapered hex prism (silhouette of a lattice tower) +
+  // crossarm + 3 glowing insulators. 5 meshes total (was 16).
+  const emiss = powered ? (0.5 + health * 1.0) * pulse : 0;
+  const glow = makeGlowColor('#c0d4ff', emiss);
+  return (
+    <group>
+      {/* lattice tower silhouette */}
+      <mesh position={[0, 1.1, 0]} material={MAT.steel}>
+        <cylinderGeometry args={[0.16, 0.34, 2.2, 6]} />
+      </mesh>
+      {/* top cross-arm */}
+      <mesh position={[0, 2.3, 0]} material={MAT.steel}>
+        <boxGeometry args={[0.85, 0.06, 0.1]} />
+      </mesh>
+      {/* 3 glowing insulators */}
+      <mesh position={[-0.38, 2.4, 0]}>
+        <sphereGeometry args={[0.07, 6, 5]} />
+        <meshBasicMaterial color={glow} />
+      </mesh>
+      <mesh position={[0, 2.4, 0]}>
+        <sphereGeometry args={[0.07, 6, 5]} />
+        <meshBasicMaterial color={glow} />
+      </mesh>
+      <mesh position={[0.38, 2.4, 0]}>
+        <sphereGeometry args={[0.07, 6, 5]} />
+        <meshBasicMaterial color={glow} />
+      </mesh>
+    </group>
+  );
+}
+
+function HouseMesh({ powered, health, pulse = 1, scale = 1 }) {
+  // 4 meshes: walls + roof + 2 glowing window strips (front/back).
+  // emiss saturates at ~1.0 via makeGlowColor, so larger numbers here just
+  // mean it reaches full brightness faster as health rises.
+  const emiss = powered ? (1.2 + health * 2.4) * pulse : 0;
+  const winColor = makeGlowColor('#ffb060', emiss);
+  return (
+    <group scale={scale}>
+      <mesh position={[0, 0.3, 0]} material={MAT.plaster}>
+        <boxGeometry args={[0.7, 0.6, 0.55]} />
+      </mesh>
+      <mesh position={[0, 0.78, 0]} rotation={[0, Math.PI / 4, 0]} material={MAT.roof}>
+        <coneGeometry args={[0.55, 0.36, 4]} />
+      </mesh>
+      <mesh position={[0, 0.3, 0.281]}>
+        <planeGeometry args={[0.5, 0.22]} />
+        <meshBasicMaterial color={winColor} side={THREE.DoubleSide} />
+      </mesh>
+      <mesh position={[0, 0.3, -0.281]} rotation={[0, Math.PI, 0]}>
+        <planeGeometry args={[0.5, 0.22]} />
+        <meshBasicMaterial color={winColor} side={THREE.DoubleSide} />
+      </mesh>
+    </group>
+  );
+}
+
+function VillageMesh({ powered, health, pulse = 1 }) {
+  return (
+    <group>
+      <group position={[-0.32, 0, -0.18]}>
+        <HouseMesh powered={powered} health={health} pulse={pulse} scale={0.75} />
+      </group>
+      <group position={[0.3, 0, -0.2]} rotation={[0, 0.5, 0]}>
+        <HouseMesh powered={powered} health={health} pulse={pulse} scale={0.8} />
+      </group>
+      <group position={[0.02, 0, 0.28]} rotation={[0, -0.3, 0]}>
+        <HouseMesh powered={powered} health={health} pulse={pulse} scale={0.85} />
+      </group>
+    </group>
+  );
+}
+
+function UtilityPoleMesh({ powered, health, pulse = 1 }) {
+  // 4 meshes: pole + crossarm + 1 glowing sphere on top (replacing 5 insulators).
+  const emiss = powered ? (0.6 + health * 1.5) * pulse : 0;
+  const glow = makeGlowColor('#ffdca8', emiss);
+  return (
+    <group>
+      <mesh position={[0, 0.65, 0]} material={MAT.wood}>
+        <cylinderGeometry args={[0.055, 0.07, 1.3, 6]} />
+      </mesh>
+      <mesh position={[0, 1.22, 0]} material={MAT.wood}>
+        <boxGeometry args={[0.6, 0.05, 0.07]} />
+      </mesh>
+      <mesh position={[-0.25, 1.28, 0]}>
+        <sphereGeometry args={[0.05, 5, 4]} />
+        <meshBasicMaterial color={glow} />
+      </mesh>
+      <mesh position={[0.25, 1.28, 0]}>
+        <sphereGeometry args={[0.05, 5, 4]} />
+        <meshBasicMaterial color={glow} />
+      </mesh>
+    </group>
+  );
+}
+
+function FactoryMesh({ powered, health, pulse = 1 }) {
+  // 6 meshes total (was 17): hangar + roof cap + 2 window strips + 1 stack +
+  // 1 glowing stack cap.
+  const emiss = powered ? (0.6 + health * 1.8) * pulse : 0;
+  const winColor = makeGlowColor('#7ee0ff', emiss);
+  const stackTip = makeGlowColor('#ff8c44', emiss * 0.6);
+  return (
+    <group>
+      <mesh position={[0, 0.4, 0]} material={MAT.factory}>
+        <boxGeometry args={[1.25, 0.8, 0.95]} />
+      </mesh>
+      <mesh position={[0, 0.86, 0]} material={MAT.factoryDk}>
+        <boxGeometry args={[1.2, 0.18, 0.95]} />
+      </mesh>
+      <mesh position={[0, 0.42, 0.476]}>
+        <planeGeometry args={[1.0, 0.36]} />
+        <meshBasicMaterial color={winColor} side={THREE.DoubleSide} />
+      </mesh>
+      <mesh position={[0, 0.42, -0.476]} rotation={[0, Math.PI, 0]}>
+        <planeGeometry args={[1.0, 0.36]} />
+        <meshBasicMaterial color={winColor} side={THREE.DoubleSide} />
+      </mesh>
+      <mesh position={[-0.4, 1.15, -0.38]} material={MAT.steelDk}>
+        <cylinderGeometry args={[0.08, 0.1, 1.0, 6]} />
+      </mesh>
+      <mesh position={[-0.4, 1.66, -0.38]}>
+        <cylinderGeometry args={[0.08, 0.08, 0.04, 6]} />
+        <meshBasicMaterial color={stackTip} />
+      </mesh>
+    </group>
+  );
+}
+
+// ────── Smart-grid renderers ──────
+// Solar — four panels on a low platform. The panel face uses MeshBasic with
+// a powered-modulated cyan tint so the array reads as "active" at a glance.
+function SolarMesh({ powered, health, pulse = 1 }) {
+  const emiss = powered ? (0.5 + health * 1.6) * pulse : 0;
+  const panelLit = makeGlowColor('#5fd0ff', emiss);
+  return (
+    <group>
+      {/* gravel pad */}
+      <mesh position={[0, 0.04, 0]} material={MAT.steelDk}>
+        <boxGeometry args={[1.1, 0.08, 0.9]} />
+      </mesh>
+      {/* four tilted panels in 2×2 layout */}
+      {[[-0.30, -0.20], [0.30, -0.20], [-0.30, 0.20], [0.30, 0.20]].map(([x, z], i) => (
+        <group key={i} position={[x, 0.22, z]} rotation={[-Math.PI / 6, 0, 0]}>
+          <mesh>
+            <boxGeometry args={[0.42, 0.02, 0.34]} />
+            <meshBasicMaterial color={panelLit} />
+          </mesh>
+          {/* dark frame underneath the lit face */}
+          <mesh position={[0, -0.015, 0]} material={MAT.steel}>
+            <boxGeometry args={[0.45, 0.02, 0.36]} />
+          </mesh>
+        </group>
+      ))}
+      {/* junction box */}
+      <mesh position={[0, 0.18, 0.5]} material={MAT.steel}>
+        <boxGeometry args={[0.18, 0.22, 0.1]} />
+      </mesh>
+    </group>
+  );
+}
+
+// Wind — tall mono-tower with three rotating blades. The rotor spins at a
+// rate tied to `health` so a struggling grid visibly slows down.
+function WindMesh({ powered, health, pulse = 1 }) {
+  const ref = useRef();
+  useFrame((_, dt) => {
+    if (!ref.current) return;
+    // Slow when unpowered (rotor freewheeling), fast when feeding the grid.
+    const speed = powered ? (1.2 + health * 1.6) : 0.15;
+    ref.current.rotation.z += dt * speed;
+  });
+  const emiss = powered ? (0.4 + health * 1.2) * pulse : 0;
+  const tipColor = makeGlowColor('#ff5252', emiss);
+  return (
+    <group>
+      {/* base pad */}
+      <mesh position={[0, 0.05, 0]} material={MAT.concrete}>
+        <cylinderGeometry args={[0.22, 0.28, 0.1, 12]} />
+      </mesh>
+      {/* tapered tower */}
+      <mesh position={[0, 1.3, 0]} material={MAT.plaster}>
+        <cylinderGeometry args={[0.06, 0.13, 2.4, 12]} />
+      </mesh>
+      {/* nacelle */}
+      <mesh position={[0, 2.55, 0.08]} material={MAT.steelDk}>
+        <boxGeometry args={[0.22, 0.18, 0.34]} />
+      </mesh>
+      {/* rotating blade assembly — 3 long blades 120° apart. Each blade is
+          wrapped in its own rotated group with the mesh offset +y by half
+          its length, so the blade extends outward from the hub instead of
+          passing through it. */}
+      <group ref={ref} position={[0, 2.55, 0.28]}>
+        {[0, 1, 2].map((i) => (
+          <group key={i} rotation={[0, 0, (i * Math.PI * 2) / 3]}>
+            <mesh position={[0, 0.55, 0]}>
+              <boxGeometry args={[0.06, 1.0, 0.02]} />
+              <meshLambertMaterial color="#f0f4f8" />
+            </mesh>
+          </group>
+        ))}
+        {/* hub cap with aviation light */}
+        <mesh position={[0, 0, 0.04]}>
+          <sphereGeometry args={[0.06, 8, 6]} />
+          <meshBasicMaterial color={tipColor} />
+        </mesh>
+      </group>
+    </group>
+  );
+}
+
+// ESS — industrial container with a glowing SOC strip on the long side.
+// We can't read the actual SOC easily from a shared mesh (it would force a
+// per-instance prop), so we just animate the strip with a slow pulse.
+function EssMesh({ powered, health, pulse = 1 }) {
+  const emiss = powered ? (0.4 + health * 1.8) * pulse : 0;
+  const stripColor = makeGlowColor('#9affc8', emiss);
+  return (
+    <group>
+      {/* container body */}
+      <mesh position={[0, 0.28, 0]} material={MAT.steel}>
+        <boxGeometry args={[0.95, 0.55, 0.55]} />
+      </mesh>
+      {/* corrugated dark band */}
+      <mesh position={[0, 0.50, 0]} material={MAT.steelDk}>
+        <boxGeometry args={[0.97, 0.06, 0.57]} />
+      </mesh>
+      {/* SOC strip — front face */}
+      <mesh position={[0, 0.30, 0.286]}>
+        <planeGeometry args={[0.7, 0.08]} />
+        <meshBasicMaterial color={stripColor} />
+      </mesh>
+      {/* SOC strip — back face */}
+      <mesh position={[0, 0.30, -0.286]} rotation={[0, Math.PI, 0]}>
+        <planeGeometry args={[0.7, 0.08]} />
+        <meshBasicMaterial color={stripColor} />
+      </mesh>
+      {/* corner pillars hint at a battery container */}
+      {[[-0.46, -0.27], [0.46, -0.27], [-0.46, 0.27], [0.46, 0.27]].map(([x, z], i) => (
+        <mesh key={i} position={[x, 0.28, z]} material={MAT.steelDk}>
+          <boxGeometry args={[0.05, 0.55, 0.05]} />
+        </mesh>
+      ))}
+    </group>
+  );
+}
+
+// Hyperscale data-center mesh — windowless concrete monolith, dense rack
+// activity LEDs on the front face, three rooftop cooling units. Purple
+// accents distinguish it from the cyan-blue factory.
+function DataCenterMesh({ powered, health, pulse = 1 }) {
+  const emiss = powered ? (0.7 + health * 2.2) * pulse : 0;
+  const rackGlow = makeGlowColor('#c878ff', emiss);
+  const accentGlow = makeGlowColor('#e8c0ff', emiss * 0.7);
+  return (
+    <group>
+      {/* main hall — taller and a bit wider than a factory */}
+      <mesh position={[0, 0.45, 0]} material={MAT.factory}>
+        <boxGeometry args={[1.35, 0.9, 0.95]} />
+      </mesh>
+      {/* dark flat roof line */}
+      <mesh position={[0, 0.93, 0]} material={MAT.factoryDk}>
+        <boxGeometry args={[1.38, 0.08, 0.97]} />
+      </mesh>
+      {/* server-rack activity strips — front face */}
+      {[-0.42, -0.14, 0.14, 0.42].map((x) => (
+        <mesh key={x} position={[x, 0.45, 0.476]}>
+          <planeGeometry args={[0.18, 0.66]} />
+          <meshBasicMaterial color={rackGlow} side={THREE.DoubleSide} />
+        </mesh>
+      ))}
+      {/* same on the back face for parallax */}
+      {[-0.42, -0.14, 0.14, 0.42].map((x) => (
+        <mesh key={`bk-${x}`} position={[x, 0.45, -0.476]} rotation={[0, Math.PI, 0]}>
+          <planeGeometry args={[0.18, 0.66]} />
+          <meshBasicMaterial color={accentGlow} side={THREE.DoubleSide} />
+        </mesh>
+      ))}
+      {/* rooftop cooling/chiller units */}
+      {[-0.42, 0, 0.42].map((x, i) => (
+        <group key={i} position={[x, 1.05, 0]}>
+          <mesh material={MAT.steel}>
+            <boxGeometry args={[0.24, 0.22, 0.42]} />
+          </mesh>
+          {/* warm exhaust glow on top of each unit */}
+          <mesh position={[0, 0.13, 0]}>
+            <boxGeometry args={[0.2, 0.03, 0.36]} />
+            <meshBasicMaterial color={accentGlow} />
+          </mesh>
+        </group>
+      ))}
+    </group>
+  );
+}
+
+const BUILDING_RENDERERS = {
+  powerPlant: PowerPlantMesh,
+  substation: SubstationMesh,
+  pylon: PylonMesh,
+  factory: FactoryMesh,
+  utilityPole: UtilityPoleMesh,
+  house: HouseMesh,
+  village: VillageMesh,
+  solar: SolarMesh,
+  wind: WindMesh,
+  ess: EssMesh,
+  dataCenter: DataCenterMesh,
+};
+
+// No per-building pointLight — the warm-bloom feeling comes entirely from
+// emissive materials on the building + tinted hex instance colors around it.
+// This is the single biggest fragment-shader win: each removed point light
+// previously made every visible meshStandardMaterial fragment do an extra
+// light calculation.
+const Building = React.memo(
+  function Building({ q, r, type, powered, health, pulse, eventOnMe, onClick }) {
+    const [x, , z] = hexToWorld(q, r);
+    const Render = BUILDING_RENDERERS[type];
+    const def = TILE_TYPES[type];
+    return (
+      <group
+        position={[x, 0, z]}
+        onClick={(e) => { e.stopPropagation(); onClick(); }}
+      >
+        <Render powered={powered} health={health} pulse={pulse} />
+        {eventOnMe && (
+          <EventMarker event={eventOnMe} height={def.height} />
+        )}
+      </group>
+    );
+  },
+  (prev, next) => (
+    prev.type === next.type
+    && prev.powered === next.powered
+    && prev.eventOnMe === next.eventOnMe
+    && prev.q === next.q && prev.r === next.r
+    && prev.onClick === next.onClick
+    && Math.abs((prev.pulse || 1) - (next.pulse || 1)) < 0.05
+    && Math.abs((prev.health || 0) - (next.health || 0)) < 0.05
+  ),
+);
+
+// ───────────────── Event visuals ─────────────────
+// Goal: read the situation at a glance, even with a busy grid. We use big
+// silhouette + bright color + motion. Visuals should feel cartoony / "game"
+// rather than realistic.
+
+const CROW_MAT = new THREE.MeshLambertMaterial({ color: '#1c1c24' });
+const CROW_WING_MAT = new THREE.MeshLambertMaterial({ color: '#2a2a34' });
+const BEAK_MAT = new THREE.MeshBasicMaterial({ color: '#ffc060' });
+const CROW_HALO_MAT = new THREE.MeshBasicMaterial({
+  color: '#cdb8ff', transparent: true, opacity: 0.55,
+});
+
+// One animated crow with flapping wings. Local origin is the body center.
+// Crow's "forward" is +X (head/beak), up is +Y, wings extend on ±Z. Wings
+// flap by rotating each wing-group around its own X axis so the wing tip
+// traces a YZ arc — i.e. proper up/down flap, not a yawing helicopter spin.
+function CrowSprite({ phase = 0, scale = 1 }) {
+  const grp = useRef();
+  const lWing = useRef();
+  const rWing = useRef();
+  useFrame(({ clock }) => {
+    const t = clock.elapsedTime + phase;
+    if (grp.current) {
+      // tiny bob to sell perch jitter
+      grp.current.position.y = Math.sin(t * 5.2) * 0.025;
+      grp.current.rotation.y = Math.sin(t * 0.8) * 0.25;
+    }
+    if (lWing.current && rWing.current) {
+      const flap = Math.sin(t * 11) * 0.65;
+      // Mirror signs: rotating around +X by negative θ lifts the +Z wing tip
+      // toward +Y, while positive θ lifts the -Z wing tip — so both wings
+      // travel UP together when flap>0 and DOWN together when flap<0.
+      lWing.current.rotation.x = -flap;
+      rWing.current.rotation.x =  flap;
+    }
+  });
+  return (
+    <group ref={grp} scale={scale}>
+      {/* body — slightly elongated */}
+      <mesh material={CROW_MAT}>
+        <sphereGeometry args={[0.18, 10, 8]} />
+      </mesh>
+      {/* head */}
+      <mesh position={[0.14, 0.05, 0]} material={CROW_MAT}>
+        <sphereGeometry args={[0.11, 8, 7]} />
+      </mesh>
+      {/* beak */}
+      <mesh position={[0.27, 0.04, 0]} rotation={[0, 0, -Math.PI / 2]} material={BEAK_MAT}>
+        <coneGeometry args={[0.05, 0.16, 5]} />
+      </mesh>
+      {/* glowing yellow eyes (cartoon menace) */}
+      <mesh position={[0.20, 0.08, 0.06]}>
+        <sphereGeometry args={[0.028, 6, 5]} />
+        <meshBasicMaterial color="#ffe060" />
+      </mesh>
+      <mesh position={[0.20, 0.08, -0.06]}>
+        <sphereGeometry args={[0.028, 6, 5]} />
+        <meshBasicMaterial color="#ffe060" />
+      </mesh>
+      {/* tail */}
+      <mesh position={[-0.18, 0.02, 0]} rotation={[0, 0, Math.PI / 2]} material={CROW_MAT}>
+        <coneGeometry args={[0.07, 0.18, 5]} />
+      </mesh>
+      {/* left wing — anchor at root, flap around z */}
+      <group ref={lWing} position={[0, 0.02, 0.12]}>
+        <mesh position={[-0.04, 0, 0.12]} material={CROW_WING_MAT}>
+          <boxGeometry args={[0.24, 0.03, 0.22]} />
+        </mesh>
+      </group>
+      <group ref={rWing} position={[0, 0.02, -0.12]}>
+        <mesh position={[-0.04, 0, -0.12]} material={CROW_WING_MAT}>
+          <boxGeometry args={[0.24, 0.03, 0.22]} />
+        </mesh>
+      </group>
+    </group>
+  );
+}
+
+// Two crows orbit the perched one — sells "flock harassing the line".
+// Heading derivation: tangent to the orbit is (-sin t, cos t). The crow's
+// local +X (head) must point that way, so rotation.y = -t - π/2 (verified
+// at t=0: position +X, velocity +Z, head must face +Z → rotation.y = -π/2).
+// The previous formula (-t + π/2) had the crow flying tail-first.
+function OrbitingCrow({ baseY, radius, speed, phase }) {
+  const grp = useRef();
+  useFrame(({ clock }) => {
+    if (!grp.current) return;
+    const t = clock.elapsedTime * speed + phase;
+    grp.current.position.set(
+      Math.cos(t) * radius,
+      baseY + Math.sin(t * 2.2) * 0.18,
+      Math.sin(t) * radius,
+    );
+    grp.current.rotation.y = -t - Math.PI / 2;
+  });
+  return (
+    <group ref={grp}>
+      <CrowSprite phase={phase * 3.1} scale={0.7} />
+    </group>
+  );
+}
+
+// Animated lightning bolt — pre-rendered zig-zag variants cycled rapidly for
+// the crackle, a bright impact flash, and a real point light so the strike
+// briefly illuminates the surrounding hexes.
+const BOLT_VARIANT_COUNT = 6;
+function LightningBolt({ targetHeight, startTime }) {
+  // Build several zig-zag variants up front.
+  const variants = useMemo(() => {
+    const out = [];
+    const segments = 8;
+    const topY = 9.5;
+    const botY = targetHeight + 0.1;
+    for (let v = 0; v < BOLT_VARIANT_COUNT; v++) {
+      const arr = [];
+      for (let i = 0; i <= segments; i++) {
+        const f = i / segments;
+        const y = topY + (botY - topY) * f;
+        // jitter shrinks as we approach the target so the bottom locks on
+        const j = (1 - f * 0.85) * 0.45;
+        const xJ = (Math.random() - 0.5) * j;
+        const zJ = (Math.random() - 0.5) * j;
+        arr.push([xJ, y, zJ]);
+      }
+      // force exact start/end on axis
+      arr[0] = [arr[0][0] * 0.15, topY, arr[0][2] * 0.15];
+      arr[arr.length - 1] = [0, botY, 0];
+      out.push(arr);
+    }
+    return out;
+  }, [targetHeight]);
+
+  const [idx, setIdx] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setIdx((i) => (i + 1) % BOLT_VARIANT_COUNT), 55);
+    return () => clearInterval(id);
+  }, []);
+
+  // Impact flash — scales and fades on a short loop synced to crackle.
+  const flashRef = useRef();
+  const lightRef = useRef();
+  useFrame(({ clock }) => {
+    const age = (performance.now() - startTime) / 1000;
+    const beat = (clock.elapsedTime * 8) % 1; // 0..1 cycle
+    const pulse = Math.max(0.15, 1 - beat) * Math.max(0, 1 - age / 2.6);
+    if (flashRef.current) {
+      flashRef.current.scale.setScalar(0.45 + pulse * 0.9);
+      flashRef.current.material.opacity = pulse * 0.95;
+    }
+    if (lightRef.current) {
+      lightRef.current.intensity = 4 + pulse * 9;
+    }
+  });
+
+  return (
+    <group>
+      {/* main bright core */}
+      <Line points={variants[idx]} color="#ffffff" lineWidth={4.2} transparent opacity={1} />
+      {/* outer halo / second bolt for thickness */}
+      <Line points={variants[(idx + 2) % BOLT_VARIANT_COUNT]} color="#9ed6ff" lineWidth={2.0} transparent opacity={0.7} />
+      {/* third faint after-image */}
+      <Line points={variants[(idx + 4) % BOLT_VARIANT_COUNT]} color="#c8e8ff" lineWidth={1.2} transparent opacity={0.4} />
+      {/* impact flash */}
+      <mesh ref={flashRef} position={[0, targetHeight + 0.15, 0]}>
+        <sphereGeometry args={[0.5, 14, 10]} />
+        <meshBasicMaterial color="#ffffff" transparent opacity={0.9} />
+      </mesh>
+      {/* strike light */}
+      <pointLight
+        ref={lightRef}
+        position={[0, targetHeight + 0.3, 0]}
+        color="#ffffff"
+        intensity={6}
+        distance={9}
+        decay={2}
+      />
+      {/* scorch ring on the ground beneath the hit */}
+      <mesh position={[0, -0.55, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+        <ringGeometry args={[0.35, 0.65, 18]} />
+        <meshBasicMaterial color="#ff8040" transparent opacity={0.7} />
+      </mesh>
+    </group>
+  );
+}
+
+function EventMarker({ event, height }) {
+  if (event.type === 'crow') {
+    return (
+      <group position={[0, height + 0.25, 0]}>
+        {/* halo ring on top of the building */}
+        <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.05, 0]} material={CROW_HALO_MAT}>
+          <ringGeometry args={[0.32, 0.52, 18]} />
+        </mesh>
+        {/* perched main crow */}
+        <CrowSprite />
+        {/* two flying companions circling the perch */}
+        <OrbitingCrow baseY={0.15} radius={0.55} speed={1.4} phase={0} />
+        <OrbitingCrow baseY={0.30} radius={0.7} speed={1.1} phase={Math.PI} />
+      </group>
+    );
+  }
+  if (event.type === 'lightning') {
+    return <LightningBolt targetHeight={height} startTime={event.startTime} />;
+  }
+  if (event.type === 'wildfire') {
+    return <WildfireFx height={height} />;
+  }
+  return null;
+}
+
+// Wildfire visual — flickering flames at the base of the pylon plus a dark
+// smoke column rising up the tower. Cheap: ~8 meshes + 1 pointLight whose
+// intensity throbs with a sine wave for the fire shimmer.
+function WildfireFx({ height }) {
+  const flameRef = useRef();
+  const smokeRef = useRef();
+  const lightRef = useRef();
+  useFrame(({ clock }) => {
+    const t = clock.elapsedTime;
+    if (flameRef.current) {
+      // independent flicker per flame mesh
+      for (let i = 0; i < flameRef.current.children.length; i++) {
+        const c = flameRef.current.children[i];
+        const s = 0.85 + 0.25 * Math.sin(t * (5 + i * 1.3) + i);
+        c.scale.set(s, 0.7 + 0.4 * Math.sin(t * 3 + i), s);
+      }
+    }
+    if (smokeRef.current) {
+      smokeRef.current.rotation.y = t * 0.4;
+      smokeRef.current.position.y = height * 0.7 + Math.sin(t * 0.8) * 0.05;
+    }
+    if (lightRef.current) {
+      lightRef.current.intensity = 3.5 + Math.sin(t * 7) * 1.5;
+    }
+  });
+  return (
+    <group>
+      {/* flames clustered around the base */}
+      <group ref={flameRef} position={[0, 0.15, 0]}>
+        {[
+          [ 0.18, 0,    0.05, '#ff3000'],
+          [-0.16, 0.08, 0.10, '#ff7020'],
+          [ 0.05, 0,   -0.16, '#ffa040'],
+          [-0.04, 0.05,-0.04, '#ffd060'],
+          [ 0.10, 0,    0.18, '#ff5018'],
+        ].map(([x, y, z, c], i) => (
+          <mesh key={i} position={[x, y, z]}>
+            <coneGeometry args={[0.13, 0.42, 5]} />
+            <meshBasicMaterial color={c} />
+          </mesh>
+        ))}
+      </group>
+      {/* smoke column up the pylon — translucent dark cone */}
+      <mesh ref={smokeRef} position={[0, height * 0.7, 0]}>
+        <coneGeometry args={[0.35, height * 1.1, 6]} />
+        <meshBasicMaterial color="#2a2520" transparent opacity={0.55} />
+      </mesh>
+      {/* embers / heat haze */}
+      <pointLight
+        ref={lightRef}
+        position={[0, 0.4, 0]}
+        color="#ff5818"
+        intensity={3.5}
+        distance={6}
+        decay={2}
+      />
+      {/* ground scorch */}
+      <mesh position={[0, -0.55, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+        <ringGeometry args={[0.4, 0.85, 22]} />
+        <meshBasicMaterial color="#5a2010" transparent opacity={0.75} />
+      </mesh>
+    </group>
+  );
+}
+
+// ───────────────── Power lines ─────────────────
+function buildCatenary(a, b, sagFactor, segments = 14) {
+  const dist = Math.hypot(b[0] - a[0], b[2] - a[2]);
+  const sag = dist * sagFactor;
+  const pts = [];
+  for (let i = 0; i <= segments; i++) {
+    const t = i / segments;
+    const x = a[0] + (b[0] - a[0]) * t;
+    const z = a[2] + (b[2] - a[2]) * t;
+    const y = a[1] + (b[1] - a[1]) * t - sag * Math.sin(Math.PI * t);
+    pts.push([x, y, z]);
+  }
+  return pts;
+}
+
+// Perpendicular horizontal offset between the two circuits of a redundant
+// (double) line. Larger = clearer visually, smaller = closer to single line.
+const REDUNDANT_LATERAL = 0.16;
+
+// PowerLine — geometry built once. Wind effect is a cheap group-level y-bob
+// via useFrame, no buffer rewrites. Memoized to skip re-render on dyn pulses.
+// When `redundant`, we render TWO catenaries with a small lateral offset so
+// the player can see at a glance that this corridor has dual circuits.
+const PowerLine = React.memo(
+  function PowerLine({ a, b, powered, health, isMain, pulse, windActive, redundant }) {
+    // Lateral perpendicular vector in the horizontal plane.
+    const perp = useMemo(() => {
+      const dx = b[0] - a[0], dz = b[2] - a[2];
+      const len = Math.hypot(dx, dz) || 1;
+      return [-dz / len, 0, dx / len];
+    }, [a, b]);
+
+    const points = useMemo(
+      () => buildCatenary(a, b, isMain ? 0.08 : 0.14, 8),
+      [a, b, isMain],
+    );
+    const pointsLeft = useMemo(() => {
+      if (!redundant) return null;
+      const o = REDUNDANT_LATERAL;
+      return buildCatenary(
+        [a[0] - perp[0] * o, a[1], a[2] - perp[2] * o],
+        [b[0] - perp[0] * o, b[1], b[2] - perp[2] * o],
+        isMain ? 0.08 : 0.14, 8,
+      );
+    }, [a, b, perp, isMain, redundant]);
+    const pointsRight = useMemo(() => {
+      if (!redundant) return null;
+      const o = REDUNDANT_LATERAL;
+      return buildCatenary(
+        [a[0] + perp[0] * o, a[1], a[2] + perp[2] * o],
+        [b[0] + perp[0] * o, b[1], b[2] + perp[2] * o],
+        isMain ? 0.08 : 0.14, 8,
+      );
+    }, [a, b, perp, isMain, redundant]);
+
+    const cableColor = useMemo(() => {
+      if (!powered) return '#6a4a55';
+      return new THREE.Color('#f4e0b8')
+        .lerp(new THREE.Color('#5a6072'), 1 - health)
+        .getStyle();
+    }, [powered, health]);
+    const lineWidth = isMain ? 1.8 : 1.4;
+    const op = powered ? 0.5 + 0.25 * health * pulse : 0.35;
+
+    const grp = useRef();
+    const phase = useMemo(() => (a[0] + a[2] + b[0] + b[2]) * 0.3, [a, b]);
+
+    useFrame(({ clock }) => {
+      if (!grp.current) return;
+      if (windActive) {
+        grp.current.position.y = Math.sin(clock.elapsedTime * 3.2 + phase) * 0.08;
+      } else if (grp.current.position.y !== 0) {
+        grp.current.position.y = 0;
+      }
+    });
+
+    return (
+      <group ref={grp}>
+        {redundant ? (
+          <>
+            <Line points={pointsLeft}  color={cableColor} lineWidth={lineWidth} transparent opacity={op} />
+            <Line points={pointsRight} color={cableColor} lineWidth={lineWidth} transparent opacity={op} />
+          </>
+        ) : (
+          <Line points={points} color={cableColor} lineWidth={lineWidth} transparent opacity={op} />
+        )}
+      </group>
+    );
+  },
+  (prev, next) => (
+    prev.powered === next.powered
+    && prev.isMain === next.isMain
+    && prev.windActive === next.windActive
+    && prev.redundant === next.redundant
+    && Math.abs((prev.health || 0) - (next.health || 0)) < 0.05
+    && Math.abs((prev.pulse || 1) - (next.pulse || 1)) < 0.05
+    && prev.a[0] === next.a[0] && prev.a[1] === next.a[1] && prev.a[2] === next.a[2]
+    && prev.b[0] === next.b[0] && prev.b[1] === next.b[1] && prev.b[2] === next.b[2]
+  ),
+);
+
+// Small, clickable midpoint badge — shows redundancy status and acts as the
+// upgrade/downgrade toggle. Glows brighter on hover; tooltip in HUD shows
+// the price (we don't render text in 3D space to keep the scene cheap).
+function EdgeUpgradeBadge({ midpoint, redundant, onHover, onLeave, onClick }) {
+  const [hovered, setHovered] = useState(false);
+  const color = redundant ? '#7be6ff' : '#9aa6c0';
+  const accent = redundant ? '#aef0ff' : '#c8d4e8';
+  return (
+    <group position={midpoint}>
+      <mesh
+        onClick={(e) => { e.stopPropagation(); onClick(); }}
+        onPointerOver={(e) => {
+          e.stopPropagation();
+          setHovered(true);
+          document.body.style.cursor = 'pointer';
+          onHover && onHover();
+        }}
+        onPointerOut={(e) => {
+          e.stopPropagation();
+          setHovered(false);
+          document.body.style.cursor = '';
+          onLeave && onLeave();
+        }}
+      >
+        <sphereGeometry args={[hovered ? 0.16 : 0.11, 10, 8]} />
+        <meshStandardMaterial
+          color={color}
+          emissive={accent}
+          emissiveIntensity={hovered ? 1.4 : (redundant ? 0.9 : 0.35)}
+          transparent
+          opacity={hovered ? 0.95 : 0.7}
+        />
+      </mesh>
+      {redundant && (
+        // Second pip beneath — visual cue that this is dual-circuit even at
+        // a glance from far away.
+        <mesh position={[0, -0.16, 0]}>
+          <sphereGeometry args={[0.07, 8, 6]} />
+          <meshStandardMaterial color={color} emissive={accent} emissiveIntensity={0.7} />
+        </mesh>
+      )}
+    </group>
+  );
+}
+
+// Redundancy is only meaningful on the 송전(transmission) backbone. In real
+// Korean grids, 154 kV+ pylon-to-pylon lines are double-circuited for N-1;
+// distribution feeders (전신주) and substation drops are single-circuit.
+// We therefore restrict the upgrade badge — and the dual-circuit rendering —
+// to edges where BOTH endpoints are pylons.
+function isRedundancyEligible(typeA, typeB) {
+  return typeA === 'pylon' && typeB === 'pylon';
+}
+
+function PowerNetwork({ edges, buildings, powered, health, pulse, windActive, redundantEdges, onHoverEdge, onLeaveEdge, onToggleRedundant }) {
+  return edges.map(([aKey, bKey], i) => {
+    const ba = buildings.get(aKey);
+    const bb = buildings.get(bKey);
+    if (!ba || !bb) return null;
+    const defA = TILE_TYPES[ba.type];
+    const defB = TILE_TYPES[bb.type];
+    const [ax, , az] = hexToWorld(ba.q, ba.r);
+    const [bx, , bz] = hexToWorld(bb.q, bb.r);
+    const ay = defA.height * 0.95;
+    const by = defB.height * 0.95;
+    const aTrans = defA.tier !== 'distribution';
+    const bTrans = defB.tier !== 'distribution';
+    const isMain = aTrans && bTrans;
+    const ok = powered[aKey] && powered[bKey];
+    const ek = edgeKey(aKey, bKey);
+    const eligible = isRedundancyEligible(ba.type, bb.type);
+    // Stale entries from old games may exist in redundantEdges for non-pylon
+    // edges; ignore them when the endpoints are no longer eligible.
+    const isRedundant = eligible && !!(redundantEdges && redundantEdges.has(ek));
+    // Midpoint of the catenary — sag dips it a bit so put the badge slightly
+    // above the chord midpoint for click-ability.
+    const midpoint = [(ax + bx) / 2, (ay + by) / 2 - 0.05, (az + bz) / 2];
+    return (
+      <React.Fragment key={`line-${i}`}>
+        <PowerLine
+          a={[ax, ay, az]}
+          b={[bx, by, bz]}
+          powered={ok}
+          health={ok ? health : 0}
+          isMain={isMain}
+          pulse={pulse}
+          windActive={windActive}
+          redundant={isRedundant}
+        />
+        {eligible && (
+          <EdgeUpgradeBadge
+            midpoint={midpoint}
+            redundant={isRedundant}
+            onHover={() => onHoverEdge && onHoverEdge(aKey, bKey)}
+            onLeave={() => onLeaveEdge && onLeaveEdge()}
+            onClick={() => onToggleRedundant && onToggleRedundant(aKey, bKey)}
+          />
+        )}
+      </React.Fragment>
+    );
+  });
+}
+
+// ───────────────── Line faults & repair workers ─────────────────
+// Time budget for a single dispatch, in seconds. Walk → work → walk-back.
+// Tuning: total < 12 s keeps player engagement up; work duration is the
+// piece the player feels (line stays "휴전 중" the longest).
+const REPAIR_WALK_SEC = 2.6;
+const REPAIR_WORK_SEC = 5.0;
+const REPAIR_TOTAL_SEC = REPAIR_WALK_SEC * 2 + REPAIR_WORK_SEC;
+
+// ────── Economy recovery ──────
+// Refund ratio on demolition — high enough that selling unprofitable assets
+// is a viable escape from bankruptcy, low enough that "build then refund"
+// loops can't replace tactical planning.
+const DEMOLISH_REFUND = 0.6;
+// Hard floor on money. Drains (fault drain, upfront fees) stop deducting
+// once we hit this. The player can still earn from any still-powered branch
+// and demolish to recover above zero.
+const MONEY_FLOOR = -500;
+// When current money first drops below 0, fire a one-shot warning toast so
+// the player notices BEFORE the floor kicks in.
+const MONEY_WARN_THRESHOLD = 0;
+// Score formula: rewards both staying solvent AND surviving long. 1 point
+// per ₩, 5 points per second alive. So a 5-minute run with ₩400 money:
+//   400 + (300 * 5) = 1900 score.
+const SCORE_PER_SECOND = 5;
+const LEADERBOARD_KEY = 'eg_leaderboard_v1';
+const LEADERBOARD_SIZE = 5;
+
+// Returns the worker's current world-space [x, y, z] given its mode/timeline.
+function workerPosition(now, w) {
+  const elapsed = (now - w.dispatchTime) / 1000;
+  const [dx, dz] = w.depotPos;
+  const [fx, fz] = w.faultMid;
+  if (elapsed < REPAIR_WALK_SEC) {
+    const t = elapsed / REPAIR_WALK_SEC;
+    return [dx + (fx - dx) * t, 0, dz + (fz - dz) * t];
+  }
+  if (elapsed < REPAIR_WALK_SEC + REPAIR_WORK_SEC) {
+    return [fx, 0, fz];
+  }
+  const t = Math.min(1, (elapsed - REPAIR_WALK_SEC - REPAIR_WORK_SEC) / REPAIR_WALK_SEC);
+  return [fx + (dx - fx) * t, 0, dz + (fz - dz) * t];
+}
+
+// Worker avatar — handles its own per-frame position interpolation so the
+// parent does not need to setState every frame. The `worker` prop is the
+// snapshot at dispatch time; nothing here updates React state.
+function WorkerAvatar({ worker }) {
+  const grpRef = useRef();
+  const [renderTick, setRenderTick] = useState(0);
+  // We want lookAt to flip when walking vs returning. Cheapest: derive each
+  // frame from current motion vector.
+  const lookRef = useRef([worker.faultMid[0], 0, worker.faultMid[1]]);
+
+  useFrame(() => {
+    if (!grpRef.current) return;
+    const now = performance.now();
+    const [x, y, z] = workerPosition(now, worker);
+    grpRef.current.position.set(x, y, z);
+    // facing target depends on mode
+    const elapsed = (now - worker.dispatchTime) / 1000;
+    if (elapsed < REPAIR_WALK_SEC) {
+      lookRef.current = [worker.faultMid[0], 0, worker.faultMid[1]];
+    } else if (elapsed < REPAIR_WALK_SEC + REPAIR_WORK_SEC) {
+      lookRef.current = [worker.faultMid[0], 0, worker.faultMid[1]];
+    } else {
+      lookRef.current = [worker.depotPos[0], 0, worker.depotPos[1]];
+    }
+  });
+
+  // mode-derived for animation crossfade — recomputed each render tick
+  // (parent forces a tick when transitioning), cheap.
+  void renderTick;
+  const now = performance.now();
+  const elapsed = (now - worker.dispatchTime) / 1000;
+  const animMode =
+    elapsed < REPAIR_WALK_SEC ? 'walking'
+    : elapsed < REPAIR_WALK_SEC + REPAIR_WORK_SEC ? 'working'
+    : 'returning';
+
+  // Force a mode-only refresh every ~0.2s so anim crossfade tracks state.
+  useEffect(() => {
+    const id = setInterval(() => setRenderTick((x) => (x + 1) & 0xff), 200);
+    return () => clearInterval(id);
+  }, []);
+
+  return (
+    <group ref={grpRef}>
+      <RepairWorker
+        position={[0, 0, 0]}
+        lookAt={[
+          lookRef.current[0] - workerPosition(performance.now(), worker)[0],
+          0,
+          lookRef.current[2] - workerPosition(performance.now(), worker)[2],
+        ]}
+        mode={animMode}
+      />
+      {animMode === 'working' && (
+        <group position={[0, 1.1, 0]}>
+          {/* working sparks */}
+          <pointLight color="#ffd86b" intensity={2.4} distance={3.5} decay={2} />
+          <mesh>
+            <sphereGeometry args={[0.08, 8, 8]} />
+            <meshStandardMaterial
+              color="#fff6c0"
+              emissive="#fff6c0"
+              emissiveIntensity={6}
+            />
+          </mesh>
+        </group>
+      )}
+    </group>
+  );
+}
+
+// Clickable warning sign that floats above a faulted line's midpoint.
+// Disappears once a worker is dispatched (parent passes hasWorker).
+// Small sparks effect — a single group whose 6 children we transform per
+// frame to sell "live wire arcing". Cheap: 6 spheres + a single useFrame.
+function FaultSparks() {
+  const groupRef = useRef();
+  useFrame(({ clock }) => {
+    const grp = groupRef.current;
+    if (!grp) return;
+    const t = clock.elapsedTime;
+    for (let i = 0; i < grp.children.length; i++) {
+      const child = grp.children[i];
+      const phase = (i / 6) * Math.PI * 2 + t * 4.5 + i;
+      const r = 0.12 + 0.06 * Math.sin(t * 7 + i);
+      child.position.set(
+        Math.cos(phase) * r,
+        Math.sin(phase * 1.7) * 0.06,
+        Math.sin(phase) * r,
+      );
+      const s = 0.5 + 0.5 * Math.abs(Math.sin(t * 9 + i * 1.7));
+      child.scale.setScalar(s);
+    }
+  });
+  return (
+    <group ref={groupRef}>
+      {Array.from({ length: 6 }).map((_, i) => (
+        <mesh key={i}>
+          <sphereGeometry args={[0.04, 6, 5]} />
+          <meshBasicMaterial color={i % 2 ? '#fffae0' : '#ff9444'} />
+        </mesh>
+      ))}
+    </group>
+  );
+}
+
+function FaultMarker({ midpoint, hasWorker, onDispatch }) {
+  const ref = useRef();
+  const tapeRef = useRef();
+  useFrame(({ clock }) => {
+    if (ref.current) {
+      ref.current.position.y = midpoint[1] + 0.6 + Math.sin(clock.elapsedTime * 3.5) * 0.08;
+      ref.current.rotation.y = clock.elapsedTime * 1.6;
+    }
+    if (tapeRef.current) {
+      // Slow rotation of the safety-tape banner so it's noticeable.
+      tapeRef.current.rotation.y = clock.elapsedTime * 0.8;
+    }
+  });
+
+  if (hasWorker) {
+    // "휴전 작업 중" — caution-tape style ring (yellow + dark stripes), a
+    // flashing dome above the fault, and a soft yellow ground halo to read
+    // "WARNING: de-energised, do not touch".
+    return (
+      <group position={[midpoint[0], midpoint[1] + 0.55, midpoint[2]]}>
+        {/* striped safety bar — 8 alternating yellow/black blocks in a ring */}
+        <group ref={tapeRef}>
+          {Array.from({ length: 12 }).map((_, i) => {
+            const a = (i / 12) * Math.PI * 2;
+            const r = 0.38;
+            return (
+              <mesh
+                key={i}
+                position={[Math.cos(a) * r, 0, Math.sin(a) * r]}
+                rotation={[0, -a, 0]}
+              >
+                <boxGeometry args={[0.05, 0.18, 0.20]} />
+                <meshBasicMaterial color={i % 2 ? '#fff080' : '#181818'} />
+              </mesh>
+            );
+          })}
+        </group>
+        {/* pulsing dome to grab attention */}
+        <mesh position={[0, 0.28, 0]}>
+          <sphereGeometry args={[0.14, 12, 10]} />
+          <meshBasicMaterial color="#fff080" transparent opacity={0.85} />
+        </mesh>
+        <pointLight color="#ffd23f" intensity={1.6} distance={4.5} decay={2} />
+      </group>
+    );
+  }
+  return (
+    <group
+      ref={ref}
+      position={[midpoint[0], midpoint[1] + 0.6, midpoint[2]]}
+      onClick={(e) => { e.stopPropagation(); onDispatch(); }}
+      onPointerOver={(e) => { e.stopPropagation(); document.body.style.cursor = 'pointer'; }}
+      onPointerOut={(e) => { e.stopPropagation(); document.body.style.cursor = ''; }}
+    >
+      {/* triangle warning sign */}
+      <mesh>
+        <coneGeometry args={[0.32, 0.06, 3]} />
+        <meshStandardMaterial color="#ff5252" emissive="#ff5252" emissiveIntensity={2.6} />
+      </mesh>
+      <mesh rotation={[0, 0, Math.PI]} position={[0, 0.05, 0]}>
+        <coneGeometry args={[0.26, 0.05, 3]} />
+        <meshStandardMaterial color="#fff080" emissive="#fff080" emissiveIntensity={2.0} />
+      </mesh>
+      <pointLight color="#ff5252" intensity={2.0} distance={4.5} decay={2} />
+      {/* arcing sparks at the broken wire */}
+      <FaultSparks />
+    </group>
+  );
+}
+
+// Helicopter wreck — dramatic burning hull at the crash midpoint. Renders on
+// top of the regular FaultMarker so the player still gets the clickable ⚠.
+function HelicopterWreck({ midpoint, hasWorker }) {
+  const hullRef = useRef();
+  const smokeRef = useRef();
+  const lightRef = useRef();
+  useFrame(({ clock }) => {
+    const t = clock.elapsedTime;
+    if (hullRef.current) {
+      // small settling wobble — wreckage isn't moving but the flames
+      // illuminate from changing angles
+      hullRef.current.rotation.z = 0.35 + Math.sin(t * 1.3) * 0.04;
+    }
+    if (smokeRef.current) {
+      smokeRef.current.rotation.y = t * 0.5;
+      smokeRef.current.position.y = midpoint[1] + 0.95 + Math.sin(t * 0.7) * 0.06;
+    }
+    if (lightRef.current) {
+      lightRef.current.intensity = hasWorker
+        ? 1.6 + Math.sin(t * 2) * 0.4
+        : 3.2 + Math.sin(t * 4.5) * 1.1;
+    }
+  });
+  return (
+    <group>
+      {/* hull — tilted on the line, half-broken */}
+      <group ref={hullRef} position={[midpoint[0], midpoint[1] - 0.05, midpoint[2]]}>
+        <mesh>
+          <boxGeometry args={[0.52, 0.18, 0.24]} />
+          <meshLambertMaterial color="#2c2018" />
+        </mesh>
+        {/* tail boom */}
+        <mesh position={[-0.32, 0.04, 0]} rotation={[0, 0, 0.4]}>
+          <boxGeometry args={[0.28, 0.06, 0.06]} />
+          <meshLambertMaterial color="#1f1812" />
+        </mesh>
+        {/* snapped rotor blade */}
+        <mesh position={[0.08, 0.16, 0]} rotation={[0, 0.6, 0.5]}>
+          <boxGeometry args={[0.52, 0.02, 0.04]} />
+          <meshLambertMaterial color="#181410" />
+        </mesh>
+        {/* embers underneath */}
+        <mesh position={[0, -0.04, 0]}>
+          <sphereGeometry args={[0.18, 10, 8]} />
+          <meshBasicMaterial color="#ff6020" />
+        </mesh>
+      </group>
+      {/* dark smoke column rising above the wreck */}
+      <mesh ref={smokeRef} position={[midpoint[0], midpoint[1] + 0.95, midpoint[2]]}>
+        <coneGeometry args={[0.35, 1.8, 6]} />
+        <meshBasicMaterial color="#1a1612" transparent opacity={0.65} />
+      </mesh>
+      <pointLight
+        ref={lightRef}
+        position={[midpoint[0], midpoint[1] + 0.15, midpoint[2]]}
+        color="#ff5818"
+        intensity={3.2}
+        distance={6}
+        decay={2}
+      />
+    </group>
+  );
+}
+
+// Floating status badge above a data-center. Color of the halo ring tells
+// the player at a glance what kind of run their hyperscaler is having:
+//   • green   — operational + RE100 (perfect grid)
+//   • cyan    — operational + VPP (load-shifting active)
+//   • purple  — operational, basic
+//   • red     — radial (needs a loop) · pulses to grab attention
+//   • grey    — offline (no power feed yet)
+// Two small spheres next to the ring stand in for the badges themselves
+// (green = RE100, cyan = VPP). Cheap to render — 1 ring + up to 2 spheres.
+function DataCenterBadge({ position, status }) {
+  const ringRef = useRef();
+  useFrame(({ clock }) => {
+    if (!ringRef.current) return;
+    if (status.state !== 'operational') {
+      const t = clock.elapsedTime;
+      const s = 1 + 0.18 * Math.sin(t * 4.5);
+      ringRef.current.scale.setScalar(s);
+    } else if (ringRef.current.scale.x !== 1) {
+      ringRef.current.scale.setScalar(1);
+    }
+  });
+  let ringColor = '#666';
+  if (status.state === 'radial') ringColor = '#ff5050';
+  else if (status.state === 'operational') {
+    ringColor = status.re100 ? '#9affc8' : (status.vpp ? '#7be6ff' : '#c878ff');
+  }
+  return (
+    <group position={[position[0], position[1] + 1.6, position[2]]}>
+      <mesh ref={ringRef} rotation={[-Math.PI / 2, 0, 0]}>
+        <ringGeometry args={[0.30, 0.46, 18]} />
+        <meshBasicMaterial color={ringColor} transparent opacity={0.9} />
+      </mesh>
+      {status.re100 && (
+        <mesh position={[-0.18, 0.10, 0]}>
+          <sphereGeometry args={[0.08, 8, 6]} />
+          <meshBasicMaterial color="#9affc8" />
+        </mesh>
+      )}
+      {status.vpp && (
+        <mesh position={[0.18, 0.10, 0]}>
+          <sphereGeometry args={[0.08, 8, 6]} />
+          <meshBasicMaterial color="#7be6ff" />
+        </mesh>
+      )}
+    </group>
+  );
+}
+
+// Renders one DataCenterBadge per data-center in the grid.
+function DataCenterBadgeLayer({ dcStatuses, buildings }) {
+  const entries = [];
+  for (const [k, status] of dcStatuses) {
+    const b = buildings.get(k);
+    if (!b) continue;
+    const [x, , z] = hexToWorld(b.q, b.r);
+    entries.push({ k, status, pos: [x, 0, z] });
+  }
+  return entries.map((e) => (
+    <DataCenterBadge key={e.k} position={e.pos} status={e.status} />
+  ));
+}
+
+// Top-level layer that resolves each faulted edge into its midpoint and
+// wires up click → dispatch. line_fault and helicopter share this rendering.
+function FaultLayer({ faultedEvents, buildings, workers, onDispatch }) {
+  return faultedEvents.map((ev) => {
+    if (!ev.target) return null;
+    const [aKey, bKey] = ev.target.split('|');
+    const ba = buildings.get(aKey);
+    const bb = buildings.get(bKey);
+    if (!ba || !bb) return null;
+    const defA = TILE_TYPES[ba.type];
+    const defB = TILE_TYPES[bb.type];
+    const [ax, , az] = hexToWorld(ba.q, ba.r);
+    const [bx, , bz] = hexToWorld(bb.q, bb.r);
+    const ay = defA.height * 0.95;
+    const by = defB.height * 0.95;
+    const midpoint = [(ax + bx) / 2, (ay + by) / 2, (az + bz) / 2];
+    const hasWorker = workers.some((w) => w.eventId === ev.id);
+    return (
+      <React.Fragment key={`fault-${ev.id}`}>
+        <FaultMarker
+          midpoint={midpoint}
+          hasWorker={hasWorker}
+          onDispatch={() => onDispatch(ev)}
+        />
+        {ev.type === 'helicopter' && (
+          <HelicopterWreck midpoint={midpoint} hasWorker={hasWorker} />
+        )}
+      </React.Fragment>
+    );
+  });
+}
+
+// ───────────────── Scene + Lighting ─────────────────
+// Linear lerp between two hex strings, returns a "#rrggbb" CSS color.
+const _lerpColorA = new THREE.Color();
+const _lerpColorB = new THREE.Color();
+function lerpHex(aHex, bHex, t) {
+  _lerpColorA.set(aHex);
+  _lerpColorB.set(bHex);
+  return '#' + _lerpColorA.lerp(_lerpColorB, t).getHexString();
+}
+
+// gridWarmth ∈ [0, 1] tells lighting how "alit" the city is. The atmospheric
+// shift — cool twilight → warm yellow sodium glow — is what carries the
+// "전력이 들어왔다" feeling. Per-hex tinting stays subtle so the ground
+// itself doesn't compete for the player's attention during long play.
+function DuskLighting({ stormy, gridWarmth = 0 }) {
+  const k = stormy ? 0.65 : 1;
+  const w = stormy ? gridWarmth * 0.55 : gridWarmth; // storms mute the bloom
+  const ambientColor = lerpHex('#a8b0c8', '#ffe6a0', w);
+  const ambientI    = (0.55 + 0.30 * w) * k;
+  const hemiSky     = lerpHex('#aab8d8', '#ffe2a8', w);
+  const hemiGround  = lerpHex('#d8884a', '#ffae5c', w);
+  const hemiI       = (0.75 + 0.20 * w) * k;
+  const sunColor    = stormy ? '#b8c4e0' : lerpHex('#ffc89a', '#ffd278', w);
+  const sunI        = (1.25 + 0.20 * w) * k;
+  const rimColor    = lerpHex('#7090d0', '#9aa0c0', w * 0.5);
+  return (
+    <>
+      <ambientLight intensity={ambientI} color={ambientColor} />
+      <hemisphereLight args={[hemiSky, hemiGround, hemiI]} />
+      <directionalLight position={[7, 5, 4]} intensity={sunI} color={sunColor} />
+      <directionalLight position={[-6, 4, -5]} intensity={0.45 * k} color={rimColor} />
+    </>
+  );
+}
+
+// Compute global grid warmth — fraction of capacity that's actually lit up.
+// We weight by demand so a powered village (60 MW) counts more than a powered
+// house (20 MW). Saturates at 8 effective consumer units so a small starter
+// town can already feel warm.
+function computeGridWarmth(buildings, powered) {
+  let lit = 0;
+  for (const [k, b] of buildings) {
+    if (!powered[k]) continue;
+    const def = TILE_TYPES[b.type];
+    if (!def || !(def.demand > 0)) continue;
+    lit += def.demand / 20; // 1 house = 1 unit
+  }
+  return Math.min(1, lit / 8);
+}
+
+function Scene({
+  tiles, buildings, buildingsKeys, hovered, setHovered, onTileClick,
+  sim, health, pulse, mapRadius,
+  eventByBuilding, windActive,
+  faultedEvents, workers, onDispatchRepair,
+  landValueByKey,
+  redundantEdges, onHoverEdge, onLeaveEdge, onToggleRedundant,
+  dcStatuses,
+}) {
+  // Stable callback identity for memoized Building components
+  const handleHover = useMemo(() => (k) => setHovered(k), [setHovered]);
+  const handleLeave = useMemo(() => () => setHovered(null), [setHovered]);
+
+  // Atmosphere warms toward sodium-yellow as more demand is being met. Memo
+  // depends on sim.powered identity, which only changes when the grid state
+  // actually changes — not every dyn pulse.
+  const gridWarmth = useMemo(
+    () => computeGridWarmth(buildings, sim.powered),
+    [buildings, sim.powered],
+  );
+  // Fog shifts toward warm amber too — sells the "evening city" haze and
+  // softens the cool blue dusk so unpowered hexes don't look frozen.
+  const fogColor = useMemo(() => {
+    if (windActive) return lerpHex('#1e2848', '#3a3a48', gridWarmth * 0.4);
+    return lerpHex('#1a2240', '#3a2d24', gridWarmth * 0.55);
+  }, [windActive, gridWarmth]);
+
+  return (
+    <>
+      <color attach="background" args={['#161e36']} />
+      <fog attach="fog" args={[fogColor, 18, 55]} />
+      <DuskLighting stormy={windActive} gridWarmth={gridWarmth} />
+      <LandFloor mapRadius={mapRadius} />
+      <TerrainLayer tiles={tiles} />
+
+      <HexGrid
+        tiles={tiles}
+        buildings={buildings}
+        buildingsKeys={buildingsKeys}
+        powered={sim.powered}
+        landValueByKey={landValueByKey}
+        onTileClick={onTileClick}
+        onHover={handleHover}
+        onLeave={handleLeave}
+      />
+      <HoverRing hovered={hovered} />
+
+      {[...buildings.entries()].map(([k, b]) => (
+        <Building
+          key={`b-${k}`}
+          q={b.q} r={b.r} type={b.type}
+          powered={!!sim.powered[k]}
+          health={sim.powered[k] ? health : 0}
+          pulse={pulse}
+          eventOnMe={eventByBuilding.get(k) || null}
+          onClick={() => onTileClick(b.q, b.r)}
+        />
+      ))}
+
+      <PowerNetwork
+        edges={sim.edges}
+        buildings={buildings}
+        powered={sim.powered}
+        health={health}
+        pulse={pulse}
+        windActive={windActive}
+        redundantEdges={redundantEdges}
+        onHoverEdge={onHoverEdge}
+        onLeaveEdge={onLeaveEdge}
+        onToggleRedundant={onToggleRedundant}
+      />
+
+      <FaultLayer
+        faultedEvents={faultedEvents}
+        buildings={buildings}
+        workers={workers}
+        onDispatch={onDispatchRepair}
+      />
+
+      {dcStatuses && dcStatuses.size > 0 && (
+        <DataCenterBadgeLayer dcStatuses={dcStatuses} buildings={buildings} />
+      )}
+
+      {workers.map((w) => (
+        <WorkerAvatar key={w.id} worker={w} />
+      ))}
+
+      <OrbitControls
+        target={[0, 0.4, 0]}
+        enablePan
+        minDistance={5}
+        maxDistance={50}
+        maxPolarAngle={Math.PI / 2 - 0.05}
+      />
+    </>
+  );
+}
+
+// ───────────────── Top-level component ─────────────────
+export default function GridBuilder3D() {
+  const [mapRadius, setMapRadius] = useState(INITIAL_RADIUS);
+  const tiles = useMemo(() => generateMap(mapRadius), [mapRadius]);
+  const [buildings, setBuildings] = useState(() => new Map());
+  const [hovered, setHovered] = useState(null);
+  const [selected, setSelected] = useState('powerPlant');
+  const [money, setMoney] = useState(INITIAL_MONEY);
+  // Redundant (double-circuit) edges — Set of edgeKey strings. line_fault on
+  // a redundant edge does NOT take down power; load is auto-transferred.
+  const [redundantEdges, setRedundantEdges] = useState(() => new Set());
+
+  // Fast O(1) terrain lookup by hex key — built once per map regen.
+  const terrainByKey = useMemo(() => {
+    const m = new Map();
+    for (const t of tiles) m.set(hexKey(t.q, t.r), t.terrain || null);
+    return m;
+  }, [tiles]);
+  const terrainLookup = useMemo(
+    () => (q, r) => terrainByKey.get(hexKey(q, r)) || null,
+    [terrainByKey],
+  );
+
+  // Land value per hex — recomputed when buildings change. Memoized so the
+  // hex tint and hover tooltip share the same numbers.
+  const landValueByKey = useMemo(() => {
+    const m = new Map();
+    for (const t of tiles) {
+      if (t.terrain === 'mountain' || t.terrain === 'river') continue;
+      m.set(hexKey(t.q, t.r), landValueAt(t.q, t.r, buildings, terrainLookup));
+    }
+    return m;
+  }, [tiles, buildings, terrainLookup]);
+
+  // Active random events. Each: { id, type, target, startTime, endTime }
+  const [events, setEvents] = useState([]);
+
+  // Disabled buildings (crow / lightning / wildfire targets) excluded from
+  // simulate(). Wildfire disables a pylon for ~15s while the fire is active.
+  const disabledKeys = useMemo(() => {
+    const s = new Set();
+    for (const e of events) {
+      if ((e.type === 'crow' || e.type === 'lightning' || e.type === 'wildfire') && e.target) {
+        s.add(e.target);
+      }
+    }
+    return s;
+  }, [events]);
+  // Faulted edges — edgeKey strings — also excluded from power propagation,
+  // but the wire itself stays rendered (player must see *where* the fault is).
+  // Helicopter crashes drop into the same bucket as line_fault for repair
+  // mechanics: clickable ⚠ marker → dispatch crew from nearest substation.
+  const faultedEdges = useMemo(() => {
+    const s = new Set();
+    for (const e of events) {
+      if ((e.type === 'line_fault' || e.type === 'helicopter') && e.target) s.add(e.target);
+    }
+    return s;
+  }, [events]);
+  const windActive = events.some((e) => e.type === 'wind');
+  const sim = useMemo(
+    () => simulate(buildings, disabledKeys, faultedEdges, terrainLookup, redundantEdges),
+    [buildings, disabledKeys, faultedEdges, terrainLookup, redundantEdges],
+  );
+
+  // ────── Repair worker dispatch ──────
+  // workers: snapshot at dispatch time. WorkerAvatar uses useFrame to lerp
+  // position from these snapshots — we never setState per frame.
+  const [workers, setWorkers] = useState([]);
+  const workersRef = useRef(workers);
+  workersRef.current = workers;
+  const workerIdRef = useRef(1);
+  const completedWorkRef = useRef(new Set());
+
+  // Active line_fault events surface to the scene so we can render markers
+  // even on edges that were *previously* live but are now down.
+  const faultedEvents = useMemo(
+    () => events.filter(
+      (e) => (e.type === 'line_fault' || e.type === 'helicopter') && e.target,
+    ),
+    [events],
+  );
+
+  const buildingsKeys = useMemo(() => new Set(buildings.keys()), [buildings]);
+
+  // Mapping from building key → event affecting it (for in-scene markers)
+  const eventByBuilding = useMemo(() => {
+    const m = new Map();
+    for (const e of events) {
+      if (e.target) m.set(e.target, e);
+    }
+    return m;
+  }, [events]);
+
+  // Data-center status map: { dcKey → { state, re100, vpp, demandFactor, incomeBonus } }.
+  // Recomputed only when buildings or grid topology actually change, not every
+  // dyn pulse. The RAF loop reads this via a ref to apply VPP relief + RE100
+  // income premium each frame, and the Scene reads it for floating status
+  // badges above each data-center mesh.
+  const dcStatuses = useMemo(() => {
+    const m = new Map();
+    for (const [k, b] of buildings) {
+      if (b.type !== 'dataCenter') continue;
+      m.set(k, dataCenterStatus(k, sim, buildings));
+    }
+    return m;
+  }, [buildings, sim]);
+  const dcStatusesRef = useRef(dcStatuses);
+  dcStatusesRef.current = dcStatuses;
+
+  // Dynamics state — re-rendered ~6 times/sec
+  const [dyn, setDyn] = useState({
+    t: 0,
+    mult: 1,
+    effDemand: 0,
+    freq: NOMINAL_FREQ,
+    health: 1,
+    score: 0,
+    pulse: 1,
+    money: INITIAL_MONEY,
+  });
+  const [toast, setToast] = useState(null);
+
+  const simRef = useRef(sim);
+  simRef.current = sim;
+  const windRef = useRef(windActive);
+  windRef.current = windActive;
+  const buildingsRef = useRef(buildings);
+  buildingsRef.current = buildings;
+  const scoreRef = useRef(0);
+  const moneyRef = useRef(INITIAL_MONEY);
+  const radiusRef = useRef(mapRadius);
+  radiusRef.current = mapRadius;
+  const eventsRef = useRef(events);
+  eventsRef.current = events;
+  // ────── Crisis + leaderboard refs ──────
+  // playtimeRef counts seconds since the FIRST building was placed — not
+  // since the page mounted. runStartedRef gates the increment so a player
+  // can sit on the menu / read the advisor without burning rank points.
+  // Reset on resetAll. crisisWarnedRef is a one-shot latch for the
+  // "철거로 회수하세요" toast — re-armed once money recovers past +200.
+  const playtimeRef = useRef(0);
+  const runStartedRef = useRef(false);
+  const crisisWarnedRef = useRef(false);
+  // Combo timer — consecutive seconds the grid has stayed inside the safe
+  // frequency band since the run began. Resets the instant the freq deviates,
+  // which makes investing in resilience (이중화 · ESS · 환상망) cash out as
+  // sustained bonus income rather than just "preventing damage".
+  const comboTimerRef = useRef(0);
+  // Per-ESS state of charge — { stored: MWh, capacity: MWh }. Lives in a ref
+  // so applyEssDynamics() can mutate without rerendering 60×/s.
+  const essStateRef = useRef(new Map());
+  // Best run loaded once on mount from localStorage; we only WRITE on reset
+  // (= end of a run) so we don't thrash storage every frame.
+  const [leaderboard, setLeaderboard] = useState(() => {
+    try {
+      const raw = localStorage.getItem(LEADERBOARD_KEY);
+      if (raw) {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr)) return arr;
+      }
+    } catch (_) { /* corrupted JSON — start fresh */ }
+    return [];
+  });
+  // Frequency low-pass: real grids have rotor inertia so freq doesn't snap.
+  // freqRef.current is the *displayed* freq (eased); each frame it drifts
+  // toward the steady-state target computed from supply/demand.
+  const freqRef = useRef(NOMINAL_FREQ);
+  const freqTargetRef = useRef(NOMINAL_FREQ);
+  const redundantEdgesRef = useRef(redundantEdges);
+  redundantEdgesRef.current = redundantEdges;
+
+  // Main RAF loop — dynamics, expansion, event spawning + expiry
+  useEffect(() => {
+    let raf;
+    let last = performance.now();
+    let t = 0;
+    let lastUiPush = 0;
+    let lastEventCheck = performance.now() + 8000; // grace period before first event
+    let nextEventDelay = 18000 + Math.random() * 14000;
+
+    const loop = (now) => {
+      const dt = Math.min(0.1, (now - last) / 1000);
+      last = now;
+      t += dt;
+      // Physics time (t) always advances so demand/renewable cycles stay
+      // continuous, but rank-scoring playtime only ticks after the run
+      // actually begins (first building placed).
+      if (runStartedRef.current) {
+        playtimeRef.current += dt;
+      }
+
+      const s = simRef.current;
+      const mult = demandMultiplier(t);
+      // Apply VPP relief: each operational data-center with a smart-grid
+      // neighbourhood shifts 30 % of its load off the grid (load-shifting to
+      // local solar/wind/ESS). Radial/offline DCs contribute their full
+      // nominal demand — they're still drawing power, just inefficiently.
+      let vppRelief = 0;
+      for (const [, status] of dcStatusesRef.current) {
+        if (status.state === 'operational' && status.vpp) {
+          vppRelief += TILE_TYPES.dataCenter.demand * (1 - status.demandFactor);
+        }
+      }
+      const effDemand = Math.max(0, s.totals.demand - vppRelief) * mult;
+      let supply = s.totals.supply;
+      if (windRef.current) supply *= WIND_SUPPLY_MULT;
+
+      // ────── Smart-grid pass ──────
+      // s.totals.supply summed every plant at nameplate. For renewables that's
+      // optimistic — actual output drifts with sun/wind. We subtract their
+      // nameplate contribution and re-add the modulated value.
+      let solarNameplate = 0;
+      let windNameplate = 0;
+      const essKeys = [];
+      for (const [bk, b] of buildingsRef.current) {
+        if (!s.powered[bk]) continue;
+        if (b.type === 'solar') solarNameplate += TILE_TYPES.solar.supply;
+        else if (b.type === 'wind') windNameplate += TILE_TYPES.wind.supply;
+        else if (b.type === 'ess') essKeys.push(bk);
+      }
+      if (solarNameplate > 0 || windNameplate > 0) {
+        supply -= solarNameplate + windNameplate;
+        const solarActual = solarNameplate * renewableFactor('solar', t);
+        const windActual = windNameplate * renewableFactor('wind', t);
+        // Smart inverters curtail when supply already outruns demand.
+        const trim = curtailFactor(supply + solarActual + windActual, effDemand);
+        supply += (solarActual + windActual) * trim;
+      }
+      // ESS auto-charge/discharge nudges supply toward demand. Run AFTER
+      // renewable curtailment so curtailment makes the first cut and ESS
+      // soaks up the residual.
+      if (essKeys.length > 0) {
+        const imbalance = supply - effDemand;
+        const essNet = applyEssDynamics(essKeys, essStateRef.current, imbalance, dt);
+        supply += essNet;
+      }
+      // Steady-state target — what the freq would settle to if conditions held.
+      const targetFreq = computeFrequency(supply, effDemand);
+      // Low-pass toward target with time constant FREQ_SMOOTH_TAU. The visible
+      // freq lags the math, which is more realistic (rotor inertia) AND gives
+      // the player a moment to react before the gauge crosses a band.
+      const lpKfreq = 1 - Math.exp(-dt / FREQ_SMOOTH_TAU);
+      freqRef.current += (targetFreq - freqRef.current) * lpKfreq;
+      freqTargetRef.current = targetFreq;
+      const freq = freqRef.current;
+      const health = gridHealthFromFreq(freq);
+      const pulse = 0.9 + 0.1 * Math.sin((t * 2 * Math.PI) / 2.6);
+
+      // ────── Outage cost ──────
+      // Every active line_fault drains money proportional to the consumer
+      // demand that's currently blacked out because of it. Rationale: 정전
+      // = 한전이 보상금/위약금을 무는 사고 상황이다. We use a per-frame drain
+      // so the player FEELS the bleed (HUD ticks down) until repair completes.
+      // Drain stops once we hit MONEY_FLOOR — the player can still recover
+      // by demolishing infrastructure (60% refund) or by earning from any
+      // still-powered branch.
+      const activeFaults = eventsRef.current.filter((e) => e.type === 'line_fault');
+      if (activeFaults.length > 0 && moneyRef.current > MONEY_FLOOR) {
+        let unpoweredDemand = 0;
+        for (const [bk, b] of buildingsRef.current) {
+          const def = TILE_TYPES[b.type];
+          if (!def || (def.demand || 0) <= 0) continue;
+          if (s.powered[bk]) continue; // only blacked-out consumers
+          unpoweredDemand += def.demand;
+        }
+        if (unpoweredDemand > 0) {
+          // ₩ per MW per second — modest enough that the player can recover.
+          // 20 MW house blacked out for 5s = ₩200 drain.
+          const drain = unpoweredDemand * 2.0 * dt;
+          moneyRef.current = Math.max(MONEY_FLOOR, moneyRef.current - drain);
+        }
+      }
+
+      // One-shot crisis warning the moment money first dips into the red,
+      // so the player understands the rescue path before they hit the floor.
+      if (moneyRef.current < MONEY_WARN_THRESHOLD && !crisisWarnedRef.current) {
+        crisisWarnedRef.current = true;
+        setToast({
+          msg: `💸 자금 부족! 같은 타입으로 클릭해 설비를 철거하면 ${Math.round(DEMOLISH_REFUND * 100)}% 환불 — 정리해서 살아남으세요`,
+          until: now + 4500,
+        });
+      } else if (moneyRef.current > MONEY_WARN_THRESHOLD + 200) {
+        // Reset the latch once the player has comfortably recovered, so a
+        // future crisis re-triggers the warning.
+        crisisWarnedRef.current = false;
+      }
+
+      // Combo tracking — only while the run is live. Stable freq builds combo,
+      // any excursion (caused by a fault, supply/demand imbalance, etc.) snaps
+      // it back to zero. Capped at 2 minutes worth so the bonus has a ceiling.
+      const stable = Math.abs(freq - NOMINAL_FREQ) <= SAFE_BAND;
+      if (runStartedRef.current) {
+        if (stable) comboTimerRef.current += dt;
+        else        comboTimerRef.current = 0;
+      }
+      const comboBonus = Math.min(1.0, comboTimerRef.current / 120);
+      const incomeMult = 1 + comboBonus;
+
+      if (stable && supply > 0) {
+        // Income should track ACTUAL delivered power — only powered consumers
+        // count, weighted by NIMBY. Data centres get two extra modifiers:
+        //   • VPP-active DCs contribute reduced demand (matches the effDemand
+        //     calc above, so freq and income use the same number)
+        //   • RE100-certified DCs pay a +20 % premium per delivered MWh
+        //   • Radial DCs (no environment loop) earn only 30 % — penalty for a
+        //     hyperscaler running on a single feeder.
+        let deliveredDemand = 0;
+        const bMap = buildingsRef.current;
+        for (const [bk, b] of bMap) {
+          const def = TILE_TYPES[b.type];
+          if (!def || (def.demand || 0) <= 0) continue;
+          if (!s.powered[bk]) continue;
+          let buildingDemand = def.demand;
+          let bonus = 1;
+          if (b.type === 'dataCenter') {
+            const status = dcStatusesRef.current.get(bk);
+            if (status) {
+              buildingDemand *= status.demandFactor;
+              bonus = status.incomeBonus;
+            }
+          }
+          deliveredDemand += buildingDemand * nimbyMultiplier(b.q, b.r, bMap) * bonus;
+        }
+        if (deliveredDemand > 0) {
+          const dMWh = (deliveredDemand * mult * dt) / 60;
+          scoreRef.current += dMWh;
+          moneyRef.current += dMWh * INCOME_PER_MWH * incomeMult;
+        }
+      }
+
+      const targetRadius = radiusForScore(scoreRef.current);
+      if (targetRadius > radiusRef.current) {
+        const newR = radiusRef.current + 1;
+        radiusRef.current = newR;
+        setMapRadius(newR);
+        setToast({
+          msg: newR >= MAX_RADIUS ? `🌟 최대 영역 도달! (r${newR})` : `🌱 새 영토 확장! (r${newR})`,
+          until: now + 3200,
+        });
+      }
+
+      // Expire events — check without allocating a new array per frame.
+      let hasExpired = false;
+      for (let i = 0; i < eventsRef.current.length; i++) {
+        if (eventsRef.current[i].endTime <= now) { hasExpired = true; break; }
+      }
+      if (hasExpired) {
+        setEvents((prev) => prev.filter((e) => e.endTime > now));
+      }
+
+      // Worker lifecycle — when the work phase finishes, restore the line
+      // (drop the line_fault event); when the return phase finishes, drop
+      // the worker. completedWorkRef guards against firing twice.
+      const ws = workersRef.current;
+      let workersDone = false;
+      const eventsToRestore = [];
+      for (let i = 0; i < ws.length; i++) {
+        const w = ws[i];
+        const elapsed = (now - w.dispatchTime) / 1000;
+        if (elapsed >= REPAIR_WALK_SEC + REPAIR_WORK_SEC
+            && !completedWorkRef.current.has(w.id)) {
+          completedWorkRef.current.add(w.id);
+          eventsToRestore.push(w.eventId);
+        }
+        if (elapsed >= REPAIR_TOTAL_SEC) workersDone = true;
+      }
+      if (eventsToRestore.length > 0) {
+        setEvents((prev) => prev.filter((e) => !eventsToRestore.includes(e.id)));
+      }
+      if (workersDone) {
+        setWorkers((prev) =>
+          prev.filter((w) => (now - w.dispatchTime) / 1000 < REPAIR_TOTAL_SEC),
+        );
+      }
+
+      // Spawn new event — pass current edges so line_fault has somewhere to
+      // land. Difficulty ramps the spawn rate: every minute the run survives,
+      // events become ~10 % more frequent (compound), capped at 5×. So a
+      // 17-minute survivor sees fault storms roughly every 5–8 s, while a
+      // fresh run gets the original ~30 s breather.
+      if (now - lastEventCheck > nextEventDelay) {
+        lastEventCheck = now;
+        const difficulty = Math.min(
+          5,
+          Math.pow(1.10, playtimeRef.current / 60),
+        );
+        nextEventDelay = (22000 + Math.random() * 18000) / difficulty;
+        const pick = pickRandomEvent(buildingsRef.current, simRef.current.edges);
+        if (pick) {
+          // Only one weather event (wind or snow) at a time.
+          const weatherAlready = eventsRef.current.some(
+            (e) => e.type === 'wind' || e.type === 'snow',
+          );
+          const isWeather = pick.type === 'wind' || pick.type === 'snow';
+          if (!(isWeather && weatherAlready)) {
+            const ev = {
+              id: nextEventId(),
+              type: pick.type,
+              target: pick.target,
+              startTime: now,
+              endTime: now + pick.duration * 1000,
+            };
+            setEvents((prev) => [...prev, ev]);
+            const def = EVENT_DEFS[pick.type];
+            // If the fault landed on a redundant edge, surface 부하절체.
+            const onRedundant = pick.type === 'line_fault'
+              && pick.target
+              && redundantEdgesRef.current.has(pick.target);
+            // Upfront incident-handling fee for a real (non-redundant) outage.
+            // Bigger than the per-second drain so the moment of failure stings.
+            let upfront = 0;
+            if (pick.type === 'line_fault' && !onRedundant) upfront = 200;
+            else if (pick.type === 'helicopter' && !onRedundant) upfront = 500; // headline incident
+            else if (pick.type === 'lightning') upfront = 350;     // bigger 사고
+            else if (pick.type === 'wildfire') upfront = 300;      // pylon foul-out
+            else if (pick.type === 'crow') upfront = 80;            // nuisance
+            if (upfront > 0) {
+              moneyRef.current = Math.max(MONEY_FLOOR, moneyRef.current - upfront);
+            }
+            const msg = onRedundant
+              ? `${def.emoji} ${def.label} — 🔄 부하절체 완료 (무중단)`
+              : upfront > 0
+                ? `${def.emoji} ${def.label} 발생! 사고 처리비 −₩${upfront}`
+                : `${def.emoji} ${def.label} 발생!`;
+            setToast({ msg, until: now + 2800 });
+          }
+        }
+      }
+
+      // Throttle UI re-render to ~6.5 Hz. The visible pulse breathing is
+      // still smooth at this rate (period is 2.6s) and dynamics math runs
+      // every frame internally regardless.
+      if (now - lastUiPush > 150) {
+        lastUiPush = now;
+        setDyn({
+          t, mult, effDemand,
+          freq, targetFreq: freqTargetRef.current,
+          health, score: scoreRef.current, pulse,
+          money: moneyRef.current,
+          playtime: playtimeRef.current,
+          rankScore: Math.max(
+            0,
+            Math.floor(moneyRef.current) + Math.floor(playtimeRef.current * SCORE_PER_SECOND),
+          ),
+          difficulty: Math.min(5, Math.pow(1.10, playtimeRef.current / 60)),
+          combo: comboTimerRef.current,
+          comboMult: incomeMult,
+        });
+      }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
+  useEffect(() => {
+    if (!toast) return;
+    const remain = Math.max(0, toast.until - performance.now());
+    const tid = setTimeout(() => setToast(null), remain);
+    return () => clearTimeout(tid);
+  }, [toast]);
+
+  const onTileClick = (q, r) => {
+    const k = hexKey(q, r);
+    // Click-to-dismiss for building-targeted events that the player can
+    // physically respond to: shoo away a crow, drop a fire crew on a wildfire.
+    // (Lightning is instant — nothing to click on. Helicopter is line-side, so
+    // it uses the FaultMarker dispatch system.)
+    const ev = eventsRef.current.find(
+      (e) => e.target === k && (e.type === 'crow' || e.type === 'wildfire'),
+    );
+    if (ev) {
+      setEvents((prev) => prev.filter((e) => e.id !== ev.id));
+      const msg = ev.type === 'crow'
+        ? '🐦 푸드덕! 까마귀를 쫓았다'
+        : '🚒 산불 진화 완료';
+      setToast({ msg, until: performance.now() + 1800 });
+      return;
+    }
+
+    const existing = buildings.get(k);
+    // Same-type click on an existing building = demolish + 60% refund.
+    // This is the player's escape valve when money runs out — sell off
+    // unprofitable infrastructure to climb back to solvency.
+    if (existing && existing.type === selected) {
+      const refund = Math.floor((existing.cost || 0) * DEMOLISH_REFUND);
+      if (refund > 0) {
+        moneyRef.current += refund;
+      }
+      setBuildings((prev) => {
+        const next = new Map(prev);
+        next.delete(k);
+        return next;
+      });
+      const def = TILE_TYPES[existing.type];
+      setToast({
+        msg: refund > 0
+          ? `🔻 ${def?.label || '설비'} 철거 · 환불 ₩${refund.toLocaleString()}`
+          : `🔻 ${def?.label || '설비'} 철거`,
+        until: performance.now() + 1600,
+      });
+      return;
+    }
+
+    // Different-type click on an existing tile is BLOCKED — the player has
+    // to explicitly demolish first (click the same type as the existing
+    // building to remove). This stops accidental free replacements during
+    // panic clicking and forces deliberate edits.
+    if (existing) {
+      const existingDef = TILE_TYPES[existing.type];
+      setToast({
+        msg: `🚫 이미 ${existingDef?.label || '설비'}가 있어요 — 먼저 같은 타입으로 클릭해 철거하세요`,
+        until: performance.now() + 2400,
+      });
+      return;
+    }
+
+    const terrain = terrainByKey.get(k) || null;
+    if (!canBuildOn(terrain, selected)) {
+      const info = TERRAIN_INFO[terrain];
+      const msg = terrain === 'forest'
+        ? '🌲 숲에는 전신주/송전탑/변전소/가정/마을만 가능'
+        : `${info?.emoji || '🚫'} ${info?.label || '여기'}에는 건설 불가`;
+      setToast({ msg, until: performance.now() + 1800 });
+      return;
+    }
+    const lv = landValueByKey.get(k) ?? 50;
+    const cost = buildCost(selected, lv);
+    // No affordability gate — the player can build into the red. The ranking
+    // formula (₩ + 시간 보너스) makes a deeply negative finish a low score
+    // rather than a game-over, so building anyway is a legitimate strategy.
+    moneyRef.current -= cost;
+    if (moneyRef.current < 0) {
+      setToast({
+        msg: `💸 −₩${cost.toLocaleString()} · 적자 건설 (보유 ₩${Math.floor(moneyRef.current).toLocaleString()})`,
+        until: performance.now() + 1800,
+      });
+    }
+
+    // First successful placement starts the run clock. Idempotent — setting
+    // true on later builds is a no-op.
+    runStartedRef.current = true;
+
+    // Store the actual cost paid so demolition can refund the right amount
+    // even if land value (and hence current quoted cost) has changed since.
+    setBuildings((prev) => {
+      const next = new Map(prev);
+      next.set(k, { q, r, type: selected, cost });
+      return next;
+    });
+  };
+
+  const resetAll = () => {
+    // First, commit the current run to the leaderboard if it's notable.
+    // We require ≥30s of playtime so accidental resets don't pollute the
+    // board with ₩1200 / 0s entries.
+    const t = playtimeRef.current;
+    const m = moneyRef.current;
+    const rank = Math.max(0, Math.floor(m) + Math.floor(t * SCORE_PER_SECOND));
+    if (t >= 30 && rank > 0) {
+      const entry = {
+        score: rank,
+        money: Math.floor(m),
+        playtime: Math.floor(t),
+        mwh: Number(scoreRef.current.toFixed(2)),
+        date: Date.now(),
+      };
+      const next = [...leaderboard, entry]
+        .sort((a, b) => b.score - a.score)
+        .slice(0, LEADERBOARD_SIZE);
+      const madeIt = next.includes(entry);
+      try { localStorage.setItem(LEADERBOARD_KEY, JSON.stringify(next)); } catch (_) {}
+      setLeaderboard(next);
+      if (madeIt) {
+        setToast({
+          msg: `🏆 랭킹 진입! ${rank.toLocaleString()}점 (${Math.floor(t / 60)}분 ${Math.floor(t % 60)}초)`,
+          until: performance.now() + 4500,
+        });
+      }
+    }
+    setBuildings(new Map());
+    setWorkers([]);
+    setEvents([]);
+    setRedundantEdges(new Set());
+    completedWorkRef.current = new Set();
+    crisisWarnedRef.current = false;
+    playtimeRef.current = 0;
+    runStartedRef.current = false;
+    comboTimerRef.current = 0;
+    scoreRef.current = 0;
+    moneyRef.current = INITIAL_MONEY;
+    freqRef.current = NOMINAL_FREQ;
+    radiusRef.current = INITIAL_RADIUS;
+    essStateRef.current = new Map();
+    setMapRadius(INITIAL_RADIUS);
+  };
+
+  // Toggle dual-circuit (N-1 redundancy) on an existing edge. Charges
+  // edgeUpgradeCost; refunds REDUNDANCY_REFUND × cost when removed.
+  const [hoveredEdge, setHoveredEdge] = useState(null);
+  const onHoverEdge = (aKey, bKey) => {
+    const ba = buildings.get(aKey);
+    const bb = buildings.get(bKey);
+    if (!ba || !bb) return;
+    const d = hexDistance(ba.q, ba.r, bb.q, bb.r);
+    const cost = edgeUpgradeCost(ba.type, bb.type, d);
+    setHoveredEdge({ aKey, bKey, cost, redundant: redundantEdges.has(edgeKey(aKey, bKey)) });
+  };
+  const onLeaveEdge = () => setHoveredEdge(null);
+  const onToggleRedundant = (aKey, bKey) => {
+    const ek = edgeKey(aKey, bKey);
+    const ba = buildings.get(aKey);
+    const bb = buildings.get(bKey);
+    if (!ba || !bb) return;
+    const d = hexDistance(ba.q, ba.r, bb.q, bb.r);
+    const cost = edgeUpgradeCost(ba.type, bb.type, d);
+    if (redundantEdges.has(ek)) {
+      const refund = Math.floor(cost * REDUNDANCY_REFUND);
+      moneyRef.current += refund;
+      setRedundantEdges((prev) => {
+        const next = new Set(prev);
+        next.delete(ek);
+        return next;
+      });
+      setToast({ msg: `🔻 이중화 해제 · 환불 ₩${refund.toLocaleString()}`, until: performance.now() + 1800 });
+    } else {
+      // No affordability gate — same rule as building placement: 적자 진행 가능.
+      moneyRef.current -= cost;
+      setRedundantEdges((prev) => {
+        const next = new Set(prev);
+        next.add(ek);
+        return next;
+      });
+      const suffix = moneyRef.current < 0
+        ? ` (적자 ₩${Math.floor(moneyRef.current).toLocaleString()})`
+        : '';
+      setToast({
+        msg: `⚡ 이중화 완료 · ₩${cost.toLocaleString()}${suffix}`,
+        until: performance.now() + 1800,
+      });
+    }
+  };
+
+  // Dispatch a repair crew from the nearest substation to a faulted line.
+  // No-op if no substation exists, or the fault already has a crew assigned.
+  const dispatchRepair = (ev) => {
+    if (!ev || !ev.target) return;
+    if (ev.type !== 'line_fault' && ev.type !== 'helicopter') return;
+    if (workersRef.current.some((w) => w.eventId === ev.id)) return;
+
+    const [aKey, bKey] = ev.target.split('|');
+    const ba = buildingsRef.current.get(aKey);
+    const bb = buildingsRef.current.get(bKey);
+    if (!ba || !bb) return;
+    const [ax, , az] = hexToWorld(ba.q, ba.r);
+    const [bx, , bz] = hexToWorld(bb.q, bb.r);
+    const faultMid = [(ax + bx) / 2, (az + bz) / 2];
+
+    // Nearest substation = depot. Hex-distance via gridLogic so the choice
+    // matches the player's mental model of "이 변전소가 더 가까워 보인다".
+    let nearestKey = null;
+    let nearestPos = null;
+    let nearestD = Infinity;
+    for (const [k, b] of buildingsRef.current.entries()) {
+      if (b.type !== 'substation') continue;
+      const [sx, , sz] = hexToWorld(b.q, b.r);
+      const d = Math.hypot(sx - faultMid[0], sz - faultMid[1]);
+      if (d < nearestD) {
+        nearestD = d;
+        nearestKey = k;
+        nearestPos = [sx, sz];
+      }
+    }
+    if (!nearestKey) {
+      setToast({
+        msg: '🛠 변전소가 있어야 복구반을 보낼 수 있어요',
+        until: performance.now() + 2400,
+      });
+      return;
+    }
+
+    const worker = {
+      id: workerIdRef.current++,
+      eventId: ev.id,
+      edgeId: ev.target,
+      depotKey: nearestKey,
+      depotPos: nearestPos,
+      faultMid,
+      dispatchTime: performance.now(),
+    };
+    setWorkers((prev) => [...prev, worker]);
+    setToast({
+      msg: '🔧 복구반 출동! 휴전 작업 진행',
+      until: performance.now() + 2200,
+    });
+  };
+
+  return (
+    <div style={{ width: '100%', height: '100%', position: 'relative' }}>
+      <Canvas
+        camera={{ position: [10, 14, 14], fov: 35 }}
+        dpr={1}
+        flat
+        gl={{
+          antialias: false,
+          powerPreference: 'high-performance',
+          stencil: false,
+          depth: true,
+        }}
+      >
+        <Scene
+          tiles={tiles}
+          buildings={buildings}
+          buildingsKeys={buildingsKeys}
+          hovered={hovered}
+          setHovered={setHovered}
+          onTileClick={onTileClick}
+          sim={sim}
+          health={dyn.health}
+          pulse={dyn.pulse}
+          mapRadius={mapRadius}
+          eventByBuilding={eventByBuilding}
+          windActive={windActive}
+          faultedEvents={faultedEvents}
+          workers={workers}
+          onDispatchRepair={dispatchRepair}
+          landValueByKey={landValueByKey}
+          redundantEdges={redundantEdges}
+          onHoverEdge={onHoverEdge}
+          onLeaveEdge={onLeaveEdge}
+          onToggleRedundant={onToggleRedundant}
+          dcStatuses={dcStatuses}
+        />
+      </Canvas>
+      <UI
+        selected={selected}
+        setSelected={setSelected}
+        sim={sim}
+        dyn={dyn}
+        mapRadius={mapRadius}
+        toast={toast}
+        events={events}
+        windActive={windActive}
+        onReset={resetAll}
+        count={buildings.size}
+        hovered={hovered}
+        terrainByKey={terrainByKey}
+        landValueByKey={landValueByKey}
+        buildings={buildings}
+        hoveredEdge={hoveredEdge}
+        redundantCount={redundantEdges.size}
+        leaderboard={leaderboard}
+        workers={workers}
+      />
+    </div>
+  );
+}
+
+// ───────────────── UI / HUD ─────────────────
+
+// Small panel that follows the cursor logically (anchored bottom-left of HUD)
+// showing the hovered hex's terrain, land value, and the cost of placing the
+// currently selected building. This is how the player learns the economy:
+// move the mouse around, see ₩ change.
+function HoverTooltip({ info, selected }) {
+  const { terrain, lv, existing, buildable, cost } = info;
+  const def = TILE_TYPES[selected];
+  const terrainInfo = terrain ? TERRAIN_INFO[terrain] : null;
+  const lvLabel = lv == null
+    ? null
+    : lv >= 80 ? '도심 (비쌈)'
+    : lv >= 65 ? '주거지'
+    : lv >= 40 ? '평범'
+    : lv >= 25 ? '외곽 (쌈)'
+    : '오지';
+  const lvColor = lv == null
+    ? '#aac'
+    : lv >= 70 ? '#ff9090'
+    : lv >= 55 ? '#ffd886'
+    : lv >= 40 ? '#a0e8b8'
+    : '#7be6ff';
+
+  return (
+    <div
+      style={{
+        position: 'absolute', left: 12, bottom: 96,
+        background: 'rgba(12,16,32,0.92)',
+        border: '1px solid #2a3a5e',
+        borderRadius: 8, padding: '10px 12px',
+        color: '#e6f7ff',
+        fontFamily: 'system-ui', fontSize: 12,
+        minWidth: 200, lineHeight: 1.5,
+        backdropFilter: 'blur(6px)',
+      }}
+    >
+      <div style={{ fontSize: 10, opacity: 0.6, letterSpacing: 1, marginBottom: 4 }}>HOVER</div>
+      {terrainInfo ? (
+        <div style={{ color: '#ffd886', fontSize: 13, fontWeight: 600, marginBottom: 4 }}>
+          {terrainInfo.emoji} {terrainInfo.label}
+        </div>
+      ) : (
+        <div style={{ color: '#a8d0ff', fontSize: 13, fontWeight: 600, marginBottom: 4 }}>
+          🟫 평지
+        </div>
+      )}
+      {lv != null && (
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+          <span style={{ opacity: 0.7 }}>땅값</span>
+          <span style={{ color: lvColor, fontFamily: 'monospace', fontWeight: 600 }}>
+            {lv} · {lvLabel}
+          </span>
+        </div>
+      )}
+      {existing ? (
+        <div style={{ marginTop: 4, fontSize: 11, opacity: 0.75 }}>
+          이미 <b style={{ color: TILE_TYPES[existing.type].color }}>
+            {TILE_TYPES[existing.type].label}
+          </b> 있음 · 같은 종류로 클릭하면 제거
+        </div>
+      ) : !buildable ? (
+        <div style={{ marginTop: 4, color: '#ff8fb4', fontSize: 11 }}>
+          ⛔ {selected === 'powerPlant' || selected === 'factory'
+            ? '발전소·공장은 평지에만 건설 가능'
+            : terrain === 'forest'
+              ? '숲에는 저압/변전소만 가능'
+              : '여기엔 건설 불가'}
+        </div>
+      ) : cost != null ? (
+        <div style={{ marginTop: 4, display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+          <span style={{ opacity: 0.7 }}>{def?.label} 건설비</span>
+          <span style={{ color: '#c8f0d8', fontFamily: 'monospace', fontWeight: 700 }}>
+            ₩{cost.toLocaleString()}
+          </span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function EdgeHoverTooltip({ edge, buildings }) {
+  const { aKey, bKey, cost, redundant } = edge;
+  const a = buildings.get(aKey);
+  const b = buildings.get(bKey);
+  if (!a || !b) return null;
+  const aDef = TILE_TYPES[a.type], bDef = TILE_TYPES[b.type];
+  return (
+    <div
+      style={{
+        position: 'absolute', left: 12, bottom: 96,
+        background: 'rgba(12,16,32,0.92)',
+        border: `1px solid ${redundant ? '#7be6ff' : '#9aa6c0'}`,
+        borderRadius: 8, padding: '10px 12px',
+        color: '#e6f7ff',
+        fontFamily: 'system-ui', fontSize: 12,
+        minWidth: 240, lineHeight: 1.5,
+        backdropFilter: 'blur(6px)',
+      }}
+    >
+      <div style={{ fontSize: 10, opacity: 0.6, letterSpacing: 1, marginBottom: 4 }}>회선</div>
+      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>
+        <span style={{ color: aDef.color }}>{aDef.label}</span>
+        {' ↔ '}
+        <span style={{ color: bDef.color }}>{bDef.label}</span>
+      </div>
+      {redundant ? (
+        <>
+          <div style={{ color: '#7be6ff', fontWeight: 600, marginBottom: 4 }}>
+            ⚡ 이중화 회선 (N-1)
+          </div>
+          <div style={{ fontSize: 11, opacity: 0.8 }}>
+            선로 고장 발생 시 자동 부하절체로 무중단 공급. 클릭하면 해제됨 (₩{Math.floor(cost * REDUNDANCY_REFUND).toLocaleString()} 환불).
+          </div>
+        </>
+      ) : (
+        <>
+          <div style={{ color: '#9aa6c0', marginBottom: 4 }}>단일회선</div>
+          <div style={{ fontSize: 11, opacity: 0.85 }}>
+            한 번 고장나면 복구 전까지 정전. 클릭 시 이중화 ↓
+          </div>
+          <div style={{ marginTop: 6, display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ opacity: 0.7 }}>이중화 비용</span>
+            <span style={{ color: '#c8f0d8', fontFamily: 'monospace', fontWeight: 700 }}>
+              ₩{cost.toLocaleString()}
+            </span>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function FreqGauge({ freq, targetFreq }) {
+  // Map freq to angle. nominal=60 → 0°. ±FREQ_MAX_DEV → ±90°.
+  const norm = Math.max(-1, Math.min(1, (freq - NOMINAL_FREQ) / FREQ_MAX_DEV));
+  const angle = norm * 90;
+  // Target needle — shows where freq is heading. Teaching cue: needle leads,
+  // target trails (or vice versa) → player learns to read the lag.
+  const tNorm = targetFreq == null
+    ? null
+    : Math.max(-1, Math.min(1, (targetFreq - NOMINAL_FREQ) / FREQ_MAX_DEV));
+  const tAngle = tNorm == null ? null : tNorm * 90;
+  const status = freqStatus(freq);
+  const color = status === 'stable' ? '#39ffa6' : status === 'warning' ? '#ffc640' : '#ff4d6d';
+  const label = status === 'stable' ? '안정' : status === 'warning' ? '경고' : '블랙아웃';
+
+  const R = 50;
+  const cx = 60, cy = 62;
+  const polar = (deg, r) => [cx + r * Math.cos((deg - 90) * Math.PI / 180), cy + r * Math.sin((deg - 90) * Math.PI / 180)];
+
+  const arcSeg = (d1, d2, c, r = R) => {
+    const [x1, y1] = polar(d1, r);
+    const [x2, y2] = polar(d2, r);
+    const large = Math.abs(d2 - d1) > 180 ? 1 : 0;
+    const sweep = d2 > d1 ? 1 : 0;
+    return <path d={`M ${x1} ${y1} A ${r} ${r} 0 ${large} ${sweep} ${x2} ${y2}`} stroke={c} strokeWidth={6} fill="none" strokeLinecap="round" />;
+  };
+
+  const safeAng = (SAFE_BAND / FREQ_MAX_DEV) * 90;
+  const warnAng = (1.0 / FREQ_MAX_DEV) * 90;
+
+  // Detect a divergence (target moving away from current) — that's what the
+  // player needs to react to.
+  const drifting = tAngle != null && Math.abs(tAngle - angle) > 4;
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+      <svg width="120" height="78" viewBox="0 0 120 78">
+        {arcSeg(-90, -warnAng, '#ff4d6d')}
+        {arcSeg(-warnAng, -safeAng, '#ffc640')}
+        {arcSeg(-safeAng, safeAng, '#39ffa6')}
+        {arcSeg(safeAng, warnAng, '#ffc640')}
+        {arcSeg(warnAng, 90, '#ff4d6d')}
+        {/* Target needle — dashed, shows where the system is heading */}
+        {tAngle != null && (
+          <line
+            x1={cx} y1={cy}
+            x2={polar(tAngle, R - 8)[0]} y2={polar(tAngle, R - 8)[1]}
+            stroke={drifting ? '#7be6ff' : '#7be6ff'} strokeWidth={1.2}
+            strokeDasharray="3 2" strokeLinecap="round" opacity={drifting ? 0.95 : 0.5}
+          />
+        )}
+        {/* Live needle */}
+        <line
+          x1={cx} y1={cy}
+          x2={polar(angle, R - 4)[0]} y2={polar(angle, R - 4)[1]}
+          stroke="#fff" strokeWidth={2} strokeLinecap="round"
+        />
+        <circle cx={cx} cy={cy} r={4} fill="#fff" />
+      </svg>
+      <div>
+        <div style={{ color, fontFamily: 'monospace', fontSize: 22, fontWeight: 700, lineHeight: 1 }}>
+          {freq.toFixed(2)} <span style={{ fontSize: 12, opacity: 0.7 }}>Hz</span>
+        </div>
+        <div style={{ color, fontSize: 11, marginTop: 2 }}>● {label}</div>
+        {drifting && targetFreq != null && (
+          <div style={{ fontSize: 10, color: '#7be6ff', marginTop: 3 }}>
+            ↗ 목표 {targetFreq.toFixed(2)} Hz
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Count how many substations are operating on a radial (single-fed)
+// transmission feed. In real practice these are the weak points of the grid —
+// one upstream fault and the whole substation drops. The fix is to tie two
+// substations together with a 송전선로 (pylon-to-pylon backbone) so they form
+// a small loop (환상망). We surface this as an educational hint once any
+// substation has ≤1 upstream transmission connection AND there's at least
+// one other substation on the map to loop into.
+function detectRadialSubstations(buildings, edges) {
+  let substationCount = 0;
+  const upstreamByKey = new Map();
+  for (const [k, b] of buildings) {
+    if (b.type === 'substation') {
+      substationCount++;
+      upstreamByKey.set(k, 0);
+    }
+  }
+  if (substationCount < 2) return 0; // need a peer to loop to
+  for (const [a, b] of edges) {
+    const ba = buildings.get(a);
+    const bb = buildings.get(b);
+    if (!ba || !bb) continue;
+    // count transmission-side feeds only (pylon / powerPlant / factory).
+    // Distribution-side taps (utility pole etc) don't reduce radialness.
+    if (ba.type === 'substation') {
+      const otherDef = TILE_TYPES[bb.type];
+      if (otherDef && otherDef.tier === 'transmission' && bb.type !== 'factory') {
+        upstreamByKey.set(a, upstreamByKey.get(a) + 1);
+      }
+    }
+    if (bb.type === 'substation') {
+      const otherDef = TILE_TYPES[ba.type];
+      if (otherDef && otherDef.tier === 'transmission' && ba.type !== 'factory') {
+        upstreamByKey.set(b, upstreamByKey.get(b) + 1);
+      }
+    }
+  }
+  let radial = 0;
+  for (const n of upstreamByKey.values()) if (n <= 1) radial++;
+  return radial;
+}
+
+// Live operating advisor — picks the single most urgent action the player
+// should take right now and presents it as a tip. Priority is fixed: safety
+// (블랙아웃) > 사고 (정전·자금) > 계통 안정 (주파수·미점등) > 운영 팁. We render
+// only the top-priority tip to avoid an info wall.
+function operatingAdvice({ freq, money, faults, workers, buildings, powered, count, edges, events }) {
+  const dev = Math.abs(freq - NOMINAL_FREQ);
+  const high = freq > NOMINAL_FREQ;
+
+  // BLACKOUT zone — immediate threat to the run
+  if (dev > 1.0) {
+    return high
+      ? {
+          level: 'critical',
+          icon: '🚨',
+          title: '주파수 위험상승 — 블랙아웃 임박',
+          body: '공급이 수요보다 훨씬 큽니다. 발전소를 하나 철거하거나, 가정/마을/공장을 빠르게 더 지어 수요를 늘리세요.',
+        }
+      : {
+          level: 'critical',
+          icon: '🚨',
+          title: '주파수 급강하 — 블랙아웃 임박',
+          body: '수요가 공급을 크게 초과합니다. 발전소를 추가하거나, 공장·마을을 한시적으로 철거해 부하를 줄이세요.',
+        };
+  }
+
+  // Unhandled outage — every second of delay costs money
+  const faultsWaiting = faults.filter(
+    (e) => !workers.some((w) => w.eventId === e.id),
+  );
+  if (faultsWaiting.length > 0) {
+    return {
+      level: 'urgent',
+      icon: '🔧',
+      title: '선로 고장 — 복구반 미출동',
+      body: '회선 위의 ⚠ 마커를 클릭하면 가장 가까운 변전소에서 작업자가 출동합니다. 정전이 지속되면 사고 처리비가 계속 차감됩니다.',
+    };
+  }
+
+  // Active wildfire — the player can click the burning pylon to scramble a
+  // fire crew. Otherwise it auto-clears in 15 s but bleeds drain the whole time.
+  const wildfires = (events || []).filter((e) => e.type === 'wildfire' && e.target);
+  if (wildfires.length > 0) {
+    return {
+      level: 'urgent',
+      icon: '🔥',
+      title: `산불 ${wildfires.length}건 진행 중`,
+      body: '불타는 송전탑을 클릭하면 진화 헬기를 투입합니다. 방치하면 15초 뒤 자연 진화되지만 그동안 송전탑은 절연 파괴로 정전입니다.',
+    };
+  }
+
+  // Money crisis
+  if (money < 0) {
+    return {
+      level: 'urgent',
+      icon: '💸',
+      title: '자금 위기',
+      body: '같은 타입으로 다시 클릭하면 설비를 60% 환불받고 철거합니다. 안 쓰는 송전탑·전신주부터 정리해 회생하세요.',
+    };
+  }
+
+  // Frequency drift — explain the rule
+  if (dev > 0.5) {
+    return high
+      ? {
+          level: 'warning',
+          icon: '↑',
+          title: `주파수 상승 (${freq.toFixed(2)} Hz)`,
+          body: '공급 > 수요 상태입니다. 발전기 회전수가 빨라져 주파수가 올라갑니다. 가정/마을을 더 짓거나, 발전소 1기를 잠시 철거해 균형을 맞추세요.',
+        }
+      : {
+          level: 'warning',
+          icon: '↓',
+          title: `주파수 하강 (${freq.toFixed(2)} Hz)`,
+          body: '수요 > 공급 상태입니다. 발전기에 부하가 걸려 주파수가 떨어집니다. 발전소를 추가하거나, 공장 같은 큰 소비처를 잠시 철거하세요.',
+        };
+  }
+
+  // Unpowered consumers despite stable freq — likely a topology problem
+  let unpowered = 0;
+  let totalConsumers = 0;
+  for (const [k, b] of buildings) {
+    const def = TILE_TYPES[b.type];
+    if (!def || (def.demand || 0) <= 0) continue;
+    totalConsumers++;
+    if (!powered[k]) unpowered++;
+  }
+  if (unpowered > 0 && totalConsumers > 0) {
+    return {
+      level: 'warning',
+      icon: '🔌',
+      title: `미점등 설비 ${unpowered}곳`,
+      body: '발전소 → 송전탑 → 변전소 → 전신주 → 가정 순서로 이어져야 합니다. 변전소가 빠지면 고압↔저압이 안 연결되고, 거리(range) 밖이면 회선이 안 생깁니다.',
+    };
+  }
+
+  // First-time onboarding
+  if (count === 0) {
+    return {
+      level: 'info',
+      icon: '🚀',
+      title: '발전소부터 시작',
+      body: '발전소(고압) → 송전탑/변전소 → 전신주(저압) → 가정 순으로 배치하세요. 주파수 60.0±0.5 Hz 안에서만 수익이 누적됩니다.',
+    };
+  }
+
+  // Radial substations — educational nudge toward 환상망 topology
+  const radial = detectRadialSubstations(buildings, edges || []);
+  if (radial > 0) {
+    return {
+      level: 'info',
+      icon: '🔗',
+      title: `라디알 변전소 ${radial}곳 — 환상망 권장`,
+      body: '변전소가 한 줄로만 급전되면(라디알) 상류 회선 한 곳이 끊겨도 정전입니다. 다른 변전소와 송전탑으로 이어 환상망(loop)을 구성하면 한쪽이 끊겨도 우회 급전이 가능합니다 — 실제 154kV/345kV 계통이 이렇게 설계됩니다.',
+    };
+  }
+
+  // Smooth sailing — nudge toward expansion / redundancy
+  return {
+    level: 'info',
+    icon: '✓',
+    title: '안정 운영 중',
+    body: '주파수 안정 · 전 설비 점등. 새 가정/마을을 더 짓거나, 송전탑↔송전탑 회선의 가운데 점을 클릭해 N-1 이중화로 신뢰성을 높이세요.',
+  };
+}
+
+const ADVISOR_STYLES = {
+  critical: { border: 'rgba(255,82,82,0.7)', bg: 'rgba(60,18,22,0.92)', titleColor: '#ff9090' },
+  urgent:   { border: 'rgba(255,180,90,0.7)', bg: 'rgba(46,30,16,0.92)', titleColor: '#ffd478' },
+  warning:  { border: 'rgba(255,216,107,0.55)', bg: 'rgba(30,28,18,0.9)', titleColor: '#fff080' },
+  info:     { border: 'rgba(125,184,255,0.4)', bg: 'rgba(12,16,32,0.88)', titleColor: '#7fc8ff' },
+};
+
+function OperatingAdvisor({ tip }) {
+  const s = ADVISOR_STYLES[tip.level] || ADVISOR_STYLES.info;
+  return (
+    <div
+      style={{
+        position: 'absolute', top: 60, left: 12,
+        background: s.bg, color: '#e6f0ff',
+        padding: '12px 14px', borderRadius: 8,
+        fontFamily: 'system-ui', fontSize: 12, maxWidth: 320,
+        lineHeight: 1.55, border: `1px solid ${s.border}`,
+        boxShadow: tip.level === 'critical'
+          ? `0 0 18px ${s.border}` : 'none',
+        transition: 'background 0.3s, border-color 0.3s',
+      }}
+    >
+      <div style={{
+        color: s.titleColor, fontWeight: 700, fontSize: 13,
+        display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4,
+      }}>
+        <span style={{ fontSize: 16 }}>{tip.icon}</span>
+        <span>{tip.title}</span>
+      </div>
+      <div style={{ opacity: 0.92 }}>{tip.body}</div>
+      <div style={{
+        marginTop: 8, paddingTop: 6,
+        borderTop: '1px solid rgba(255,255,255,0.08)',
+        fontSize: 10, opacity: 0.55,
+      }}>
+        🖱️ 클릭=배치 · 같은 타입 클릭=철거(60% 환불) · 드래그=회전 · 휠=줌
+      </div>
+    </div>
+  );
+}
+
+// Combo meter — fills as the grid stays inside SAFE_BAND, caps at 120 s for
+// max bonus +100 %. Gold gradient when full, fading to dim when empty so the
+// player can read at-a-glance how close they are to the cap.
+function ComboMeter({ combo, bonus }) {
+  const pct = Math.min(100, (combo / 120) * 100);
+  const sec = Math.floor(combo);
+  return (
+    <div style={{ fontSize: 10, lineHeight: 1.4 }}>
+      <div style={{
+        display: 'flex', justifyContent: 'space-between',
+        color: bonus > 0 ? '#ffd86b' : '#7aa',
+      }}>
+        <span>🔥 콤보 {sec}초</span>
+        <span style={{ fontFamily: 'monospace' }}>
+          {bonus > 0 ? `+${Math.round(bonus * 100)}%` : '—'}
+        </span>
+      </div>
+      <div style={{
+        height: 4, background: '#1c2640', borderRadius: 2, overflow: 'hidden',
+      }}>
+        <div style={{
+          height: '100%', width: `${pct}%`,
+          background: 'linear-gradient(90deg, #ffd86b, #ff9040)',
+          transition: 'width 0.2s',
+        }} />
+      </div>
+    </div>
+  );
+}
+
+// Difficulty meter — climbs +10 % per minute, caps at 5×. Reds out at high
+// difficulty so the player feels the pressure visually.
+function DifficultyMeter({ difficulty }) {
+  const pct = Math.min(100, ((difficulty - 1) / 4) * 100);
+  const hot = difficulty >= 2.5;
+  return (
+    <div style={{ fontSize: 10, lineHeight: 1.4 }}>
+      <div style={{
+        display: 'flex', justifyContent: 'space-between',
+        color: hot ? '#ff8080' : '#a0c8ff',
+      }}>
+        <span>⚠ 난이도</span>
+        <span style={{ fontFamily: 'monospace' }}>×{difficulty.toFixed(2)}</span>
+      </div>
+      <div style={{
+        height: 4, background: '#1c2640', borderRadius: 2, overflow: 'hidden',
+      }}>
+        <div style={{
+          height: '100%', width: `${pct}%`,
+          background: hot
+            ? 'linear-gradient(90deg, #ff7050, #ff3050)'
+            : 'linear-gradient(90deg, #7fc8ff, #ff9040)',
+          transition: 'width 0.2s',
+        }} />
+      </div>
+    </div>
+  );
+}
+
+// Persisted ranking from localStorage. Sorted by `score` desc. The current
+// run is shown as a ghost row so the player can see where they'd land if
+// they reset right now.
+function LeaderboardPanel({ entries, currentScore, currentPlaytime, currentMoney, onClose }) {
+  const fmtTime = (s) => {
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return `${m}:${String(sec).padStart(2, '0')}`;
+  };
+  const fmtDate = (ts) => {
+    if (!ts) return '';
+    const d = new Date(ts);
+    return `${d.getMonth() + 1}/${d.getDate()}`;
+  };
+  // Where would the current run rank if we committed now?
+  const rankIfNow = entries.filter((e) => e.score > currentScore).length + 1;
+  return (
+    <div
+      style={{
+        position: 'absolute', top: '50%', left: '50%',
+        transform: 'translate(-50%, -50%)',
+        background: 'rgba(12,16,32,0.96)', color: '#e6f7ff',
+        padding: 22, borderRadius: 14,
+        fontFamily: 'system-ui', fontSize: 13,
+        minWidth: 340, maxWidth: 420,
+        border: '1px solid #2a3a5e',
+        boxShadow: '0 12px 40px rgba(0,0,0,0.6)',
+        zIndex: 100,
+      }}
+    >
+      <div style={{
+        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        marginBottom: 14,
+      }}>
+        <div style={{ color: '#ffd86b', fontWeight: 700, fontSize: 16, letterSpacing: 1 }}>
+          🏆 RANKING
+        </div>
+        <button
+          onClick={onClose}
+          style={{
+            background: 'transparent', color: '#7aa', border: '1px solid #456',
+            borderRadius: 4, padding: '3px 10px', cursor: 'pointer', fontSize: 11,
+          }}
+        >닫기</button>
+      </div>
+      <div style={{ fontSize: 11, opacity: 0.7, marginBottom: 10 }}>
+        오래 살아남고, 자금을 많이 보유할수록 점수가 높습니다 · 초기화 시 등록
+      </div>
+      {entries.length === 0 ? (
+        <div style={{
+          padding: 24, textAlign: 'center', color: '#7aa',
+          background: 'rgba(0,0,0,0.25)', borderRadius: 8, fontSize: 12,
+        }}>
+          아직 등록된 기록이 없습니다.<br />
+          30초 이상 플레이 후 초기화하면 등록됩니다.
+        </div>
+      ) : (
+        <div style={{ display: 'grid', gap: 4 }}>
+          {entries.map((e, i) => (
+            <div key={i} style={{
+              display: 'grid',
+              gridTemplateColumns: '24px 1fr auto auto 36px',
+              gap: 10, alignItems: 'baseline',
+              padding: '6px 10px',
+              background: i === 0 ? 'rgba(255,216,107,0.10)' : 'rgba(255,255,255,0.03)',
+              borderRadius: 6,
+              border: i === 0 ? '1px solid rgba(255,216,107,0.4)' : '1px solid transparent',
+            }}>
+              <span style={{
+                color: i === 0 ? '#ffd86b' : '#7fc8ff',
+                fontWeight: 700, fontFamily: 'monospace',
+              }}>#{i + 1}</span>
+              <span style={{ color: '#fff6a0', fontFamily: 'monospace', fontWeight: 600 }}>
+                {e.score.toLocaleString()}
+              </span>
+              <span style={{ color: '#a0e8b8', fontSize: 11, fontFamily: 'monospace' }}>
+                ₩{e.money.toLocaleString()}
+              </span>
+              <span style={{ color: '#a0c8ff', fontSize: 11, fontFamily: 'monospace' }}>
+                {fmtTime(e.playtime)}
+              </span>
+              <span style={{ color: '#567', fontSize: 10, textAlign: 'right' }}>
+                {fmtDate(e.date)}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+      {/* Current run preview */}
+      <div style={{
+        marginTop: 14, padding: '8px 10px',
+        background: 'rgba(125,184,255,0.10)',
+        border: '1px dashed rgba(125,184,255,0.4)',
+        borderRadius: 6,
+        display: 'grid', gridTemplateColumns: '1fr auto auto auto',
+        gap: 10, alignItems: 'baseline', fontSize: 12,
+      }}>
+        <span style={{ color: '#a0c8ff' }}>지금 초기화하면 → #{rankIfNow}</span>
+        <span style={{ color: '#fff6a0', fontFamily: 'monospace', fontWeight: 600 }}>
+          {currentScore.toLocaleString()}
+        </span>
+        <span style={{ color: '#a0e8b8', fontSize: 11, fontFamily: 'monospace' }}>
+          ₩{Math.floor(currentMoney).toLocaleString()}
+        </span>
+        <span style={{ color: '#a0c8ff', fontSize: 11, fontFamily: 'monospace' }}>
+          {fmtTime(currentPlaytime)}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function UI({
+  selected, setSelected, sim, dyn, mapRadius, toast, events, windActive, onReset, count,
+  hovered, terrainByKey, landValueByKey, buildings,
+  hoveredEdge, redundantCount, leaderboard, workers,
+}) {
+  const [showBoard, setShowBoard] = useState(false);
+
+  // Live advisor tip — recomputed whenever the relevant slice of state moves.
+  // Deps kept narrow so we don't churn the tip every dyn pulse.
+  const faultEvents = useMemo(
+    () => (events || []).filter((e) => e.type === 'line_fault'),
+    [events],
+  );
+  const advisorTip = useMemo(
+    () => operatingAdvice({
+      freq: dyn.freq,
+      money: dyn.money,
+      faults: faultEvents,
+      workers: workers || [],
+      buildings,
+      powered: sim.powered,
+      count,
+      edges: sim.edges,
+      events,
+    }),
+    [dyn.freq, dyn.money, faultEvents, workers, buildings, sim.powered, count, sim.edges, events],
+  );
+  // Hover tooltip data — depends on the currently hovered hex.
+  const hoverInfo = useMemo(() => {
+    if (!hovered) return null;
+    const [qs, rs] = hovered.split(',');
+    const q = parseInt(qs, 10), r = parseInt(rs, 10);
+    const terrain = terrainByKey?.get(hovered) || null;
+    const lv = landValueByKey?.get(hovered) ?? null;
+    const existing = buildings?.get(hovered);
+    const buildable = canBuildOn(terrain, selected);
+    const cost = (!existing && buildable && lv != null)
+      ? buildCost(selected, lv)
+      : null;
+    return { q, r, terrain, lv, existing, buildable, cost };
+  }, [hovered, terrainByKey, landValueByKey, buildings, selected]);
+
+  const supplyMult = windActive ? WIND_SUPPLY_MULT : 1;
+  const effSupply = Math.round(sim.totals.supply * supplyMult);
+  const supplyTinted = supplyMult < 1;
+  const nextMilestone = useMemo(() => {
+    for (const m of EXPANSION_MILESTONES) {
+      if (dyn.score < m) return m;
+    }
+    return null;
+  }, [dyn.score]);
+  const balance = sim.totals.supply - dyn.effDemand;
+  const balanceColor = Math.abs(dyn.freq - NOMINAL_FREQ) <= SAFE_BAND
+    ? '#39ffa6'
+    : balance < 0 ? '#ff4d6d' : '#ffc640';
+
+  return (
+    <>
+      {/* Top-right HUD */}
+      <div
+        style={{
+          position: 'absolute', top: 12, right: 12,
+          background: 'rgba(12,16,32,0.88)', color: '#e6f7ff',
+          padding: 14, borderRadius: 10,
+          fontFamily: 'system-ui', fontSize: 13, minWidth: 260,
+          border: '1px solid #2a3a5e',
+          backdropFilter: 'blur(8px)',
+        }}
+      >
+        <div style={{ color: '#7fc8ff', fontWeight: 700, letterSpacing: 1, fontSize: 11, marginBottom: 8 }}>
+          ⚡ GRID FREQUENCY
+        </div>
+        <FreqGauge freq={dyn.freq} targetFreq={dyn.targetFreq} />
+
+        <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid #2a3a5e', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 12px', fontSize: 12 }}>
+          <div style={{ opacity: 0.7 }}>
+            공급
+            {windActive && <span style={{ color: '#9ee8c0', marginLeft: 4 }}>🌪️</span>}
+          </div>
+          <div style={{ textAlign: 'right', color: supplyTinted ? '#a0c8ff' : '#ffd16b', fontFamily: 'monospace' }}>
+            {effSupply} MW
+          </div>
+          <div style={{ opacity: 0.7 }}>실효 수요</div>
+          <div style={{ textAlign: 'right', color: '#ff8fb4', fontFamily: 'monospace' }}>{dyn.effDemand.toFixed(0)} MW</div>
+          <div style={{ opacity: 0.7 }}>여유</div>
+          <div style={{ textAlign: 'right', color: balanceColor, fontFamily: 'monospace', fontWeight: 600 }}>
+            {balance >= 0 ? '+' : ''}{balance.toFixed(0)} MW
+          </div>
+          <div style={{ opacity: 0.7 }}>수요 배율</div>
+          <div style={{ textAlign: 'right', color: '#a8d0ff', fontFamily: 'monospace' }}>×{dyn.mult.toFixed(2)}</div>
+        </div>
+
+        <div style={{
+          marginTop: 10, padding: 10,
+          background: dyn.money < 0 ? 'rgba(255, 80, 80, 0.12)' : 'rgba(122, 220, 130, 0.08)',
+          borderRadius: 6,
+          border: `1px solid ${dyn.money < 0 ? 'rgba(255,90,90,0.5)' : 'rgba(122,220,130,0.35)'}`,
+          transition: 'background 0.3s, border-color 0.3s',
+        }}>
+          <div style={{
+            fontSize: 10,
+            color: dyn.money < 0 ? '#ff9090' : '#a0e8b8',
+            letterSpacing: 1, display: 'flex', justifyContent: 'space-between',
+          }}>
+            <span>FUNDS · 자금{dyn.money < 0 ? ' · 위기' : ''}</span>
+            <span style={{ opacity: 0.7 }}>
+              +₩{INCOME_PER_MWH}/MWh
+              {dyn.comboMult > 1.001 && (
+                <span style={{
+                  color: '#ffd86b', marginLeft: 4, fontWeight: 700,
+                }}>
+                  ×{dyn.comboMult.toFixed(2)}
+                </span>
+              )}
+            </span>
+          </div>
+          <div style={{
+            fontSize: 22, fontFamily: 'monospace',
+            color: dyn.money < 0 ? '#ffb0b0' : '#c8f0d8',
+            fontWeight: 700, lineHeight: 1.1,
+          }}>
+            ₩{Math.floor(dyn.money).toLocaleString()}
+          </div>
+          {/* Combo + difficulty meters — small dual progress bars below the
+              fund amount. Combo fills as freq stays stable; difficulty fills
+              as the run survives. Bonus income visible at a glance. */}
+          <div style={{ marginTop: 6, display: 'grid', gap: 4 }}>
+            <ComboMeter combo={dyn.combo || 0} bonus={(dyn.comboMult || 1) - 1} />
+            <DifficultyMeter difficulty={dyn.difficulty || 1} />
+          </div>
+          <div style={{ fontSize: 10, opacity: 0.6, marginTop: 4 }}>
+            {dyn.money < 0
+              ? '같은 타입 클릭으로 설비 철거 시 60% 환불'
+              : '주파수 안정 유지 → 콤보 ↑ → 보너스 수익'}
+          </div>
+        </div>
+
+        {/* Playtime + rank score — feeds the leaderboard on reset */}
+        <div style={{
+          marginTop: 8, padding: 10,
+          background: 'rgba(125, 184, 255, 0.08)',
+          borderRadius: 6, border: '1px solid rgba(125,184,255,0.3)',
+        }}>
+          <div style={{
+            fontSize: 10, color: '#a0c8ff', letterSpacing: 1,
+            display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+          }}>
+            <span>RANK · 점수</span>
+            <button
+              onClick={() => setShowBoard((v) => !v)}
+              style={{
+                background: 'transparent', color: '#7fc8ff',
+                border: '1px solid #7fc8ff', borderRadius: 4,
+                padding: '1px 8px', cursor: 'pointer', fontSize: 10,
+                fontFamily: 'system-ui',
+              }}
+            >{showBoard ? '닫기' : '🏆'}</button>
+          </div>
+          <div style={{
+            fontSize: 18, fontFamily: 'monospace',
+            color: '#d0e6ff', fontWeight: 700, lineHeight: 1.2,
+            display: 'flex', justifyContent: 'space-between', alignItems: 'baseline',
+          }}>
+            <span>{(dyn.rankScore || 0).toLocaleString()}</span>
+            <span style={{ fontSize: 11, opacity: 0.75 }}>
+              {Math.floor((dyn.playtime || 0) / 60)}:{String(Math.floor((dyn.playtime || 0) % 60)).padStart(2, '0')}
+            </span>
+          </div>
+          <div style={{ fontSize: 10, opacity: 0.55, marginTop: 2 }}>
+            ₩ + 5점/초 · 초기화 시 랭킹 등록
+          </div>
+        </div>
+
+        <div style={{ marginTop: 8, padding: 10, background: 'rgba(255, 216, 107, 0.07)', borderRadius: 6, border: '1px solid rgba(255,216,107,0.3)' }}>
+          <div style={{ fontSize: 10, color: '#ffd86b', letterSpacing: 1 }}>SCORE · 누적 공급량</div>
+          <div style={{ fontSize: 22, fontFamily: 'monospace', color: '#fff6a0', fontWeight: 700, lineHeight: 1.1 }}>
+            {dyn.score.toFixed(2)} <span style={{ fontSize: 11, opacity: 0.7 }}>MWh</span>
+          </div>
+          <div style={{ fontSize: 10, opacity: 0.6, marginTop: 2 }}>주파수가 ±0.5 Hz 안일 때만 적립</div>
+        </div>
+
+        {nextMilestone !== null && (
+          <div style={{ marginTop: 8, fontSize: 10, opacity: 0.65 }}>
+            다음 확장까지 <span style={{ color: '#a0e8b8' }}>{(nextMilestone - dyn.score).toFixed(1)} MWh</span>
+            <div style={{ marginTop: 4, height: 3, background: '#1c2640', borderRadius: 2, overflow: 'hidden' }}>
+              <div style={{
+                height: '100%',
+                width: `${Math.min(100, (dyn.score / nextMilestone) * 100)}%`,
+                background: 'linear-gradient(90deg, #ffd86b, #a0e8b8)',
+                transition: 'width 0.3s',
+              }} />
+            </div>
+          </div>
+        )}
+        <div style={{ marginTop: 8, fontSize: 11, opacity: 0.55, display: 'flex', justifyContent: 'space-between' }}>
+          <span>
+            건물 {count} · 회선 {sim.edges.length}
+            {redundantCount > 0 && <span style={{ color: '#7be6ff' }}> (이중화 {redundantCount})</span>}
+            {' · '}영역 r{mapRadius}
+          </span>
+          <button
+            onClick={onReset}
+            style={{
+              background: 'transparent', color: '#ff8fb4',
+              border: '1px solid #ff8fb4', borderRadius: 4,
+              padding: '2px 8px', cursor: 'pointer', fontSize: 10,
+            }}
+          >초기화</button>
+        </div>
+      </div>
+
+      {/* active events strip */}
+      {events.length > 0 && (
+        <div
+          style={{
+            position: 'absolute', top: 12, left: '50%',
+            transform: 'translateX(-50%)',
+            display: 'flex', gap: 8,
+            fontFamily: 'system-ui',
+          }}
+        >
+          {events.map((e) => {
+            const def = EVENT_DEFS[e.type];
+            const remain = Math.max(0, (e.endTime - performance.now()) / 1000);
+            const total = def.duration;
+            return (
+              <div
+                key={e.id}
+                style={{
+                  background: 'rgba(20,25,42,0.92)',
+                  border: `1px solid ${def.color}`,
+                  borderRadius: 10,
+                  padding: '8px 12px',
+                  color: def.color,
+                  fontSize: 12,
+                  fontWeight: 600,
+                  minWidth: 140,
+                  boxShadow: `0 0 16px ${def.color}33`,
+                }}
+              >
+                <div>{def.emoji} {def.label}</div>
+                <div style={{ marginTop: 6, height: 3, background: '#1c2640', borderRadius: 2, overflow: 'hidden' }}>
+                  <div style={{
+                    height: '100%',
+                    width: `${(remain / total) * 100}%`,
+                    background: def.color,
+                  }} />
+                </div>
+                {e.type === 'crow' && (
+                  <div style={{ marginTop: 4, fontSize: 10, opacity: 0.75, fontWeight: 400 }}>
+                    해당 전신주/송전탑을 클릭해서 쫓아내세요
+                  </div>
+                )}
+                {e.type === 'wildfire' && (
+                  <div style={{ marginTop: 4, fontSize: 10, opacity: 0.75, fontWeight: 400 }}>
+                    송전탑 절연 파괴 — 15초 후 자연 진화
+                  </div>
+                )}
+                {e.type === 'helicopter' && (
+                  <div style={{ marginTop: 4, fontSize: 10, opacity: 0.75, fontWeight: 400 }}>
+                    송전선로 절단 — 🔧 마커 클릭해 복구반 출동
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* expansion toast */}
+      {toast && (
+        <div
+          style={{
+            position: 'absolute', top: 24, left: '50%',
+            transform: 'translateX(-50%)',
+            background: 'rgba(20,30,50,0.95)',
+            color: '#fff6c8',
+            padding: '14px 24px',
+            borderRadius: 999,
+            fontFamily: 'system-ui', fontSize: 14, fontWeight: 600,
+            border: '1px solid #ffd86b',
+            boxShadow: '0 0 24px rgba(255, 216, 107, 0.4)',
+            animation: 'eg-toast-pop 0.4s ease-out',
+          }}
+        >
+          {toast.msg}
+        </div>
+      )}
+
+      {/* Top-left advisor — live tip based on current grid state */}
+      <OperatingAdvisor tip={advisorTip} />
+
+      {/* Leaderboard overlay — toggled by the 🏆 button in the RANK card. */}
+      {showBoard && (
+        <LeaderboardPanel
+          entries={leaderboard}
+          currentScore={dyn.rankScore || 0}
+          currentPlaytime={dyn.playtime || 0}
+          currentMoney={dyn.money}
+          onClose={() => setShowBoard(false)}
+        />
+      )}
+
+      {/* Hover tooltip — info about the hex under the cursor */}
+      {hoverInfo && !hoveredEdge && (
+        <HoverTooltip info={hoverInfo} selected={selected} />
+      )}
+      {/* Edge hover tooltip — shown when the cursor is over a line badge */}
+      {hoveredEdge && (
+        <EdgeHoverTooltip edge={hoveredEdge} buildings={buildings} />
+      )}
+
+      {/* Bottom palette — split into traditional grid and smart-grid groups.
+          The vertical divider keeps both visible at once so the player can
+          flip between a coal-and-pylons playstyle and a renewables-plus-ESS
+          one in the same run. */}
+      <div
+        style={{
+          position: 'absolute', bottom: 14, left: '50%',
+          transform: 'translateX(-50%)',
+          background: 'rgba(12,16,32,0.92)',
+          padding: '8px 12px', borderRadius: 14,
+          fontFamily: 'system-ui',
+          display: 'flex', gap: 12, alignItems: 'stretch',
+          maxWidth: '96vw',
+          overflowX: 'auto',
+          border: '1px solid #2a3a5e',
+          backdropFilter: 'blur(8px)',
+        }}
+      >
+        <PaletteGroup
+          title="전력계통"
+          subtitle="발전 · 송전 · 변전 · 배전"
+          accent="#9ec4ff"
+          keys={TRADITIONAL_KEYS}
+          selected={selected}
+          setSelected={setSelected}
+        />
+        <div style={{ width: 1, background: 'rgba(125,184,255,0.25)' }} />
+        <PaletteGroup
+          title="스마트그리드"
+          subtitle="신재생 · 자동 출력제어 · ESS"
+          accent="#9affc8"
+          keys={SMART_GRID_KEYS}
+          selected={selected}
+          setSelected={setSelected}
+        />
+        <div style={{ width: 1, background: 'rgba(200,120,255,0.25)' }} />
+        <PaletteGroup
+          title="특수설비"
+          subtitle="환상망 + RE100 보너스"
+          accent="#c878ff"
+          keys={SPECIAL_KEYS}
+          selected={selected}
+          setSelected={setSelected}
+        />
+      </div>
+    </>
+  );
+}
+
+// Palette button group with a labelled header. All building cards are now
+// FIXED width — long desc strings used to inflate smart-grid cards and push
+// the special-facility group off-screen on narrower monitors. Uniform width
+// + label-only ellipsis is the simplest fix.
+const PALETTE_CARD_WIDTH = 88;
+function PaletteGroup({ title, subtitle, accent, keys, selected, setSelected }) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      <div style={{
+        fontSize: 10, letterSpacing: 1, color: accent, fontWeight: 700,
+        display: 'flex', alignItems: 'baseline', gap: 6,
+        whiteSpace: 'nowrap', overflow: 'hidden',
+      }}>
+        <span>{title}</span>
+        <span style={{
+          opacity: 0.5, fontWeight: 400, fontSize: 9,
+          textOverflow: 'ellipsis', overflow: 'hidden',
+        }}>{subtitle}</span>
+      </div>
+      <div style={{ display: 'flex', gap: 6 }}>
+        {keys.map((k) => {
+          const def = TILE_TYPES[k];
+          const active = selected === k;
+          return (
+            <button
+              key={k}
+              onClick={() => setSelected(k)}
+              style={{
+                padding: '8px 6px',
+                background: active ? def.color : 'transparent',
+                color: active ? '#0a0e27' : '#e6f7ff',
+                border: `1.5px solid ${def.color}`,
+                borderRadius: 10,
+                cursor: 'pointer',
+                fontWeight: active ? 700 : 500,
+                fontSize: 12,
+                whiteSpace: 'nowrap',
+                width: PALETTE_CARD_WIDTH,
+                textAlign: 'center',
+                boxShadow: active ? `0 0 16px ${def.color}55` : 'none',
+                transition: 'all 0.15s',
+                overflow: 'hidden',
+              }}
+              title={def.desc /* full desc on hover */}
+            >
+              <div style={{ fontSize: 13 }}>{def.label}</div>
+              <div style={{
+                fontSize: 10, opacity: 0.78, marginTop: 3,
+                overflow: 'hidden', textOverflow: 'ellipsis',
+              }}>
+                {def.desc}
+              </div>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
