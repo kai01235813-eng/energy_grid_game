@@ -433,6 +433,75 @@ export function buildRenewableClusterMap(buildings) {
   return m;
 }
 
+// ────────── 햇빛소득마을 (Sunshine Income Village) ──────────
+// Korean rural-development program: when a village collectively installs a
+// large solar farm, the income is shared among residents. In this game it
+// triggers when ≥3 SOLAR panels form a connected cluster (each within
+// hex-distance 2 of another). Wind doesn't qualify — the policy is solar-
+// specific. Each village earns its players a one-shot achievement bonus and
+// ongoing trickle income while the cluster stays intact + grid-connected.
+//
+// Returns: [{ id, count, members: [keys], centroid: { q, r } }]
+//   id  — stable hash of the sorted member-key list, so re-rendering doesn't
+//         re-fire the achievement toast for the same village.
+//   centroid — for placing the visual effect on the map.
+const SUNSHINE_MIN_CLUSTER = 3;
+// Bumped 2 → 3 after playtesters reported 3 panels not registering as a
+// village when they spaced them apart by a single empty hex (which reads
+// as "close together" to the eye but hex-distance is actually 2-3).
+const SUNSHINE_LINK_DISTANCE = 3;
+export function findSunshineVillages(buildings) {
+  const solars = [];
+  for (const [k, b] of buildings) {
+    if (b.type === 'solar') solars.push({ key: k, q: b.q, r: b.r });
+  }
+  if (solars.length < SUNSHINE_MIN_CLUSTER) return [];
+
+  // Union-find by hex proximity. Solar panels within SUNSHINE_LINK_DISTANCE
+  // hexes of each other are treated as one farm.
+  const parent = solars.map((_, i) => i);
+  const find = (x) => parent[x] === x ? x : (parent[x] = find(parent[x]));
+  const union = (a, b) => { parent[find(a)] = find(b); };
+  for (let i = 0; i < solars.length; i++) {
+    for (let j = i + 1; j < solars.length; j++) {
+      if (hexDistance(solars[i].q, solars[i].r, solars[j].q, solars[j].r) <= SUNSHINE_LINK_DISTANCE) {
+        union(i, j);
+      }
+    }
+  }
+
+  const groups = new Map();
+  for (let i = 0; i < solars.length; i++) {
+    const r = find(i);
+    if (!groups.has(r)) groups.set(r, []);
+    groups.get(r).push(solars[i]);
+  }
+
+  const villages = [];
+  for (const members of groups.values()) {
+    if (members.length < SUNSHINE_MIN_CLUSTER) continue;
+    let cq = 0, cr = 0;
+    for (const m of members) { cq += m.q; cr += m.r; }
+    cq /= members.length;
+    cr /= members.length;
+    const id = members.map((m) => m.key).sort().join('|');
+    villages.push({
+      id,
+      count: members.length,
+      members: members.map((m) => m.key),
+      centroid: { q: cq, r: cr },
+    });
+  }
+  return villages;
+}
+
+// Per-second bonus income while a sunshine village is active and at least
+// half of its members are powered. Scales with village size — bigger farms,
+// bigger village payout.
+export const SUNSHINE_INCOME_PER_PANEL_PER_SEC = 8;
+// One-shot achievement bonus the first time a village forms.
+export const SUNSHINE_ACHIEVEMENT_BONUS = 600;
+
 export function canConnect(typeA, typeB, ctx = null) {
   const a = TILE_TYPES[typeA];
   const b = TILE_TYPES[typeB];
@@ -779,6 +848,27 @@ export const EVENT_DEFS = {
     weight: 1,
     pickTarget(buildings) {
       const pool = [...buildings.entries()].filter(([, b]) => b.type === 'pylon');
+      if (pool.length === 0) return null;
+      return pool[Math.floor(Math.random() * pool.length)][0];
+    },
+  },
+  // 지장전주 — an existing utility pole is suddenly in the way of a real-
+  // world activity and must be relocated. Three real-life causes drive the
+  // payout direction:
+  //   road_expansion  → 공공도로 확장 (지자체 비용 부담)   → +500 보상
+  //   private_land    → 사유지 재산권 행사 (한전 비용 부담) → −150 이설비
+  //   building_access → 건축 진출입로 확보 (신청자 부담)    → +300 수익
+  // RAF spawn loop attaches the subtype (`obstructionKind`) after pickTarget
+  // chooses which pole. If the player doesn't relocate within `duration`,
+  // the pole is removed and a steep timeout penalty is applied.
+  pole_obstruction: {
+    label: '지장전주',
+    emoji: '🚧',
+    color: '#ffb74d',
+    duration: 28,
+    weight: 3,
+    pickTarget(buildings) {
+      const pool = [...buildings.entries()].filter(([, b]) => b.type === 'utilityPole');
       if (pool.length === 0) return null;
       return pool[Math.floor(Math.random() * pool.length)][0];
     },

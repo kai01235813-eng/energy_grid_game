@@ -16,6 +16,8 @@ import {
   edgeUpgradeCost, REDUNDANCY_REFUND, FREQ_SMOOTH_TAU,
   renewableFactor, curtailFactor, applyEssDynamics,
   dataCenterStatus,
+  findSunshineVillages,
+  SUNSHINE_INCOME_PER_PANEL_PER_SEC, SUNSHINE_ACHIEVEMENT_BONUS,
 } from './gridLogic';
 import RepairWorker from './RepairWorker';
 
@@ -56,6 +58,47 @@ const COLOR_LV_LOW    = new THREE.Color('#1b2740'); // cheap outskirts (cool)
 function hexAxialDistance(q1, r1, q2, r2) {
   return (Math.abs(q1 - q2) + Math.abs(r1 - r2) + Math.abs(q1 + r1 - q2 - r2)) / 2;
 }
+
+// ────────── Mobile / thermal-aware rendering profile ──────────
+// Phones throttle hard when the GPU + radio are both hot. Three big wins:
+//   1) cap DPR to 1 on touch devices (Lambert fragment cost is per-pixel)
+//   2) drop MSAA (the panels are already low-poly)
+//   3) cap render rate to ~30 fps via R3F's frameloop="demand" + a metered
+//      invalidate(). Game physics still ticks every frame in our own RAF
+//      loop; we just stop ASKING three.js to re-rasterise every frame.
+// Detected once at module load — a portrait→landscape rotation doesn't
+// suddenly change device class.
+const IS_MOBILE = typeof navigator !== 'undefined'
+  && /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '');
+
+// Viewport-driven compact mode. Used by the HUD to shrink panels + the
+// palette so they stop overlapping on small landscapes (and on CSS-rotated
+// portrait phones, where the effective landscape footprint can be tiny).
+// Tracks live so rotating the device or resizing a desktop window updates.
+function useIsCompact() {
+  const compute = () => {
+    if (typeof window === 'undefined') return false;
+    const w = window.innerWidth, h = window.innerHeight;
+    return Math.max(w, h) < 1000 || Math.min(w, h) < 600;
+  };
+  const [compact, setCompact] = useState(compute);
+  useEffect(() => {
+    const onResize = () => setCompact(compute());
+    window.addEventListener('resize', onResize);
+    window.addEventListener('orientationchange', onResize);
+    return () => {
+      window.removeEventListener('resize', onResize);
+      window.removeEventListener('orientationchange', onResize);
+    };
+  }, []);
+  return compact;
+}
+const MOBILE_DPR = [1, 1];
+const DESKTOP_DPR = [1, 2];
+const MOBILE_FRAME_INTERVAL_MS = 1000 / 30; // 30 fps target on phones
+// React-side dynamics push throttle — mobile gets a slower HUD update so the
+// CPU sleeps more between frames. Desktop stays at the original 150 ms.
+const DYN_PUSH_INTERVAL_MS = IS_MOBILE ? 220 : 150;
 
 // Maximum hex count we'll ever need — sized for MAX_RADIUS. Pre-allocating
 // the InstancedMesh buffer at this capacity (instead of growing it as the
@@ -1248,6 +1291,22 @@ const REPAIR_WALK_SEC = 2.6;
 const REPAIR_WORK_SEC = 5.0;
 const REPAIR_TOTAL_SEC = REPAIR_WALK_SEC * 2 + REPAIR_WORK_SEC;
 
+// ────── 지장전주 (utility-pole obstruction) ──────
+// Three real-world causes drive different cost flows:
+//   road_expansion  — 지자체가 비용 보전 → 플레이어에게 +보상
+//   private_land    — 한전 부담 → 플레이어가 이설비 지출
+//   building_access — 건축주 부담 → 플레이어에게 수익
+// If the player ignores the marker until the event auto-expires, the pole is
+// silently demolished (removed from buildings) AND a steep penalty applies.
+const OBSTRUCTION_KINDS = ['road_expansion', 'private_land', 'building_access'];
+const OBSTRUCTION_INFO = {
+  road_expansion: { label: '도로 확장', emoji: '🛣️', color: '#7be6ff', reward: 500 },
+  private_land:   { label: '사유지 재산권', emoji: '🏠', color: '#ffb074', reward: -150 },
+  building_access:{ label: '건축 진출입로', emoji: '🚗', color: '#a0e8b8', reward: 300 },
+};
+const OBSTRUCTION_TIMEOUT_PENALTY = 400;
+const OBSTRUCTION_RELOCATE_RANGE = 2;
+
 // ────── Economy recovery ──────
 // Refund ratio on demolition — high enough that selling unprofitable assets
 // is a viable escape from bankruptcy, low enough that "build then refund"
@@ -1571,6 +1630,239 @@ function DataCenterBadge({ position, status }) {
   );
 }
 
+// ────────── 지장전주 marker + relocation highlight ──────────
+// Construction-cone marker that floats above an obstructed utility pole.
+// Clicking enters relocation mode in the parent — the marker itself is
+// just a clickable visual. Color and emoji vary by obstruction subtype.
+function ObstructionMarker({ position, kind, remainingSec, onClick }) {
+  const info = OBSTRUCTION_INFO[kind] || OBSTRUCTION_INFO.private_land;
+  const ref = useRef();
+  useFrame(({ clock }) => {
+    if (!ref.current) return;
+    const t = clock.elapsedTime;
+    ref.current.position.y = position[1] + 1.0 + Math.sin(t * 3.2) * 0.10;
+    ref.current.rotation.y = t * 1.4;
+  });
+  return (
+    <group ref={ref} position={[position[0], position[1] + 1.0, position[2]]}>
+      {/* construction cone */}
+      <mesh
+        onClick={(e) => { e.stopPropagation(); onClick(); }}
+        onPointerOver={(e) => { e.stopPropagation(); document.body.style.cursor = 'pointer'; }}
+        onPointerOut={(e) => { e.stopPropagation(); document.body.style.cursor = ''; }}
+      >
+        <coneGeometry args={[0.22, 0.46, 8]} />
+        <meshStandardMaterial
+          color={info.color}
+          emissive={info.color}
+          emissiveIntensity={2.0}
+        />
+      </mesh>
+      {/* white reflective stripe */}
+      <mesh position={[0, 0.0, 0]}>
+        <cylinderGeometry args={[0.18, 0.18, 0.06, 12, 1, true]} />
+        <meshBasicMaterial color="#ffffff" side={THREE.DoubleSide} />
+      </mesh>
+      {/* small ground-level timer ring shows remaining time */}
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.95, 0]}>
+        <ringGeometry args={[0.42, 0.5, 24, 1, 0, Math.PI * 2 * remainingSec]} />
+        <meshBasicMaterial color={info.color} transparent opacity={0.75} side={THREE.DoubleSide} />
+      </mesh>
+      <pointLight color={info.color} intensity={1.4} distance={3.5} decay={2} />
+    </group>
+  );
+}
+
+// Renders every active obstruction marker. The parent passes the relocation
+// state so we can skip the marker on the pole currently being moved (avoids
+// visual confusion during the click→click flow).
+function ObstructionLayer({ obstructions, buildings, relocationMode, onMarkerClick }) {
+  const now = performance.now();
+  return obstructions.map((ev) => {
+    if (!ev.target) return null;
+    if (relocationMode && relocationMode.eventId === ev.id) return null;
+    const b = buildings.get(ev.target);
+    if (!b) return null;
+    const [x, , z] = hexToWorld(b.q, b.r);
+    const remain = Math.max(0, (ev.endTime - now) / 1000);
+    const total = EVENT_DEFS.pole_obstruction.duration;
+    return (
+      <ObstructionMarker
+        key={`obs-${ev.id}`}
+        position={[x, 1.35, z]}
+        kind={ev.obstructionKind || 'private_land'}
+        remainingSec={Math.min(1, remain / total)}
+        onClick={() => onMarkerClick(ev)}
+      />
+    );
+  });
+}
+
+// Green halo on a hex eligible to receive the relocated pole. Pulses gently
+// so the player's eye lands on it. Empty array if not in relocation mode.
+function RelocationTargets({ relocationMode, buildings, terrainByKey, onPick }) {
+  if (!relocationMode) return null;
+  const candidates = [];
+  const { fromQ, fromR } = relocationMode;
+  for (let dq = -OBSTRUCTION_RELOCATE_RANGE; dq <= OBSTRUCTION_RELOCATE_RANGE; dq++) {
+    for (let dr = -OBSTRUCTION_RELOCATE_RANGE; dr <= OBSTRUCTION_RELOCATE_RANGE; dr++) {
+      if (Math.abs(dq + dr) > OBSTRUCTION_RELOCATE_RANGE) continue;
+      if (dq === 0 && dr === 0) continue;
+      const tq = fromQ + dq;
+      const tr = fromR + dr;
+      const tk = hexKey(tq, tr);
+      if (buildings.has(tk)) continue;
+      const terrain = terrainByKey ? terrainByKey.get(tk) : null;
+      if (!canBuildOn(terrain, 'utilityPole')) continue;
+      candidates.push({ q: tq, r: tr, k: tk });
+    }
+  }
+  return candidates.map((c) => {
+    const [x, , z] = hexToWorld(c.q, c.r);
+    return (
+      <PulsingTargetHalo
+        key={`tg-${c.k}`}
+        position={[x, 0.05, z]}
+        onPick={() => onPick(c.q, c.r)}
+      />
+    );
+  });
+}
+
+function PulsingTargetHalo({ position, onPick }) {
+  const ref = useRef();
+  useFrame(({ clock }) => {
+    if (!ref.current) return;
+    const phase = Math.sin(clock.elapsedTime * 3.0) * 0.5 + 0.5;
+    ref.current.scale.setScalar(0.85 + phase * 0.2);
+    ref.current.material.opacity = 0.45 + phase * 0.35;
+  });
+  return (
+    <mesh
+      ref={ref}
+      position={position}
+      rotation={[-Math.PI / 2, 0, 0]}
+      onClick={(e) => { e.stopPropagation(); onPick(); }}
+      onPointerOver={(e) => { e.stopPropagation(); document.body.style.cursor = 'pointer'; }}
+      onPointerOut={(e) => { e.stopPropagation(); document.body.style.cursor = ''; }}
+    >
+      <ringGeometry args={[HEX_R * 0.7, HEX_R * 0.92, 6]} />
+      <meshBasicMaterial color="#9affc8" transparent opacity={0.6} />
+    </mesh>
+  );
+}
+
+// ────────── 햇빛소득마을 visual ──────────
+// Golden light-pillar effect at the cluster centroid. Cheap by design —
+// one ring + one pillar mesh + one floating sun + one pointLight, all
+// hand-animated via a single useFrame. Sized so it's unmistakable from any
+// reasonable camera distance, but not so loud it covers the panels themselves.
+function SunshineVillage({ position, count }) {
+  const groupRef = useRef();
+  const sunRef = useRef();
+  const ringRef = useRef();
+  const lightRef = useRef();
+  useFrame(({ clock }) => {
+    const t = clock.elapsedTime;
+    // Sun bobs and spins gently
+    if (sunRef.current) {
+      sunRef.current.position.y = 2.6 + Math.sin(t * 1.4) * 0.18;
+      sunRef.current.rotation.y = t * 0.6;
+      const s = 1 + 0.08 * Math.sin(t * 3.3);
+      sunRef.current.scale.setScalar(s);
+    }
+    // Ring pulses outward — scale loop
+    if (ringRef.current) {
+      const phase = (t * 0.6) % 1;
+      ringRef.current.scale.setScalar(0.7 + phase * 0.7);
+      ringRef.current.material.opacity = 0.5 * (1 - phase);
+    }
+    // Light intensity throbs subtly
+    if (lightRef.current) {
+      lightRef.current.intensity = 3.2 + Math.sin(t * 2.0) * 0.6;
+    }
+  });
+  return (
+    <group ref={groupRef} position={position}>
+      {/* fixed golden ring on the ground (the village footprint) */}
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.05, 0]}>
+        <ringGeometry args={[0.9, 1.2, 32]} />
+        <meshBasicMaterial color="#ffd86b" transparent opacity={0.6} />
+      </mesh>
+      {/* pulsing outer ring */}
+      <mesh ref={ringRef} rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.05, 0]}>
+        <ringGeometry args={[1.0, 1.05, 32]} />
+        <meshBasicMaterial color="#fff080" transparent opacity={0.5} />
+      </mesh>
+      {/* vertical light pillar */}
+      <mesh position={[0, 4, 0]}>
+        <cylinderGeometry args={[0.5, 1.0, 8, 16, 1, true]} />
+        <meshBasicMaterial color="#ffd86b" transparent opacity={0.13} side={THREE.DoubleSide} depthWrite={false} />
+      </mesh>
+      {/* floating sun icon */}
+      <group ref={sunRef} position={[0, 2.6, 0]}>
+        <mesh>
+          <sphereGeometry args={[0.35, 16, 12]} />
+          <meshBasicMaterial color="#fff080" />
+        </mesh>
+        {/* sun rays — 8 small spikes around the sphere */}
+        {Array.from({ length: 8 }).map((_, i) => {
+          const a = (i / 8) * Math.PI * 2;
+          return (
+            <mesh
+              key={i}
+              position={[Math.cos(a) * 0.5, 0, Math.sin(a) * 0.5]}
+              rotation={[0, -a, 0]}
+            >
+              <coneGeometry args={[0.06, 0.22, 4]} />
+              <meshBasicMaterial color="#ffe060" />
+            </mesh>
+          );
+        })}
+      </group>
+      {/* warm village light */}
+      <pointLight
+        ref={lightRef}
+        position={[0, 2.5, 0]}
+        color="#ffd86b"
+        intensity={3.2}
+        distance={7}
+        decay={2}
+      />
+      {/* small "panels" count beads on the rim for at-a-glance scale */}
+      {Array.from({ length: Math.min(count, 8) }).map((_, i) => {
+        const a = (i / 8) * Math.PI * 2;
+        return (
+          <mesh key={`bead-${i}`} position={[Math.cos(a) * 1.35, 0.18, Math.sin(a) * 1.35]}>
+            <sphereGeometry args={[0.07, 8, 6]} />
+            <meshBasicMaterial color="#ff9040" />
+          </mesh>
+        );
+      })}
+    </group>
+  );
+}
+
+// Map cluster centroid (q, r — may be fractional from averaging) into world
+// coords by interpolating two synthetic neighbours.
+function sunshineCentroidToWorld(centroid) {
+  // hexToWorld is linear, so we can compute directly with the formula
+  // instead of round-tripping through integer hex coordinates.
+  const x = (3 / 2) * HEX_R * centroid.q;
+  const z = Math.sqrt(3) * HEX_R * (centroid.r + centroid.q / 2);
+  return [x, 0, z];
+}
+
+function SunshineVillageLayer({ villages }) {
+  return villages.map((v) => (
+    <SunshineVillage
+      key={v.id}
+      position={sunshineCentroidToWorld(v.centroid)}
+      count={v.count}
+    />
+  ));
+}
+
 // Renders one DataCenterBadge per data-center in the grid.
 function DataCenterBadgeLayer({ dcStatuses, buildings }) {
   const entries = [];
@@ -1674,7 +1966,9 @@ function Scene({
   faultedEvents, workers, onDispatchRepair,
   landValueByKey,
   redundantEdges, onHoverEdge, onLeaveEdge, onToggleRedundant,
-  dcStatuses,
+  dcStatuses, sunshineVillages,
+  obstructionEvents, relocationMode, onObstructionMarkerClick,
+  terrainByKey,
 }) {
   // Stable callback identity for memoized Building components
   const handleHover = useMemo(() => (k) => setHovered(k), [setHovered]);
@@ -1749,6 +2043,26 @@ function Scene({
       {dcStatuses && dcStatuses.size > 0 && (
         <DataCenterBadgeLayer dcStatuses={dcStatuses} buildings={buildings} />
       )}
+
+      {sunshineVillages && sunshineVillages.length > 0 && (
+        <SunshineVillageLayer villages={sunshineVillages} />
+      )}
+
+      {obstructionEvents && obstructionEvents.length > 0 && (
+        <ObstructionLayer
+          obstructions={obstructionEvents}
+          buildings={buildings}
+          relocationMode={relocationMode}
+          onMarkerClick={onObstructionMarkerClick}
+        />
+      )}
+
+      <RelocationTargets
+        relocationMode={relocationMode}
+        buildings={buildings}
+        terrainByKey={terrainByKey}
+        onPick={onTileClick}
+      />
 
       {workers.map((w) => (
         <WorkerAvatar key={w.id} worker={w} />
@@ -1859,6 +2173,48 @@ export default function GridBuilder3D() {
     return m;
   }, [events]);
 
+  // Active 지장전주 events surface to the scene so we can render markers
+  // even on poles that are otherwise normal.
+  const obstructionEvents = useMemo(
+    () => events.filter((e) => e.type === 'pole_obstruction' && e.target),
+    [events],
+  );
+  // Relocation mode — set when the player clicks an obstruction marker.
+  // While non-null the next valid hex click moves the pole there; clicking
+  // anywhere else (or the same marker again) cancels.
+  const [relocationMode, setRelocationMode] = useState(null);
+
+  // Sunshine villages — 3+ connected solar panels qualify as a 햇빛소득마을.
+  // Recomputed whenever buildings change so adding/removing a panel updates
+  // the cluster immediately. ref mirror gives the RAF loop O(1) access.
+  const sunshineVillages = useMemo(
+    () => findSunshineVillages(buildings),
+    [buildings],
+  );
+  const sunshineVillagesRef = useRef(sunshineVillages);
+  sunshineVillagesRef.current = sunshineVillages;
+  // First-time-seen latch — fire the achievement toast only on a NEW village
+  // ID. Persists across the run (cleared on resetAll).
+  const achievedVillagesRef = useRef(new Set());
+
+  // Achievement toast: when a brand-new village ID appears, celebrate it
+  // once with a toast + one-off cash bonus. Subsequent renders with the same
+  // ID are no-ops thanks to the latch.
+  useEffect(() => {
+    const seen = achievedVillagesRef.current;
+    let bonusFired = 0;
+    for (const v of sunshineVillages) {
+      if (seen.has(v.id)) continue;
+      seen.add(v.id);
+      bonusFired += SUNSHINE_ACHIEVEMENT_BONUS;
+      setToast({
+        msg: `☀️ 햇빛소득마을 완성! 태양광 ${v.count}기 단지 · +₩${SUNSHINE_ACHIEVEMENT_BONUS.toLocaleString()}`,
+        until: performance.now() + 4200,
+      });
+    }
+    if (bonusFired > 0) moneyRef.current += bonusFired;
+  }, [sunshineVillages]);
+
   // Data-center status map: { dcKey → { state, re100, vpp, demandFactor, incomeBonus } }.
   // Recomputed only when buildings or grid topology actually change, not every
   // dyn pulse. The RAF loop reads this via a ref to apply VPP relief + RE100
@@ -1917,6 +2273,11 @@ export default function GridBuilder3D() {
   // Per-ESS state of charge — { stored: MWh, capacity: MWh }. Lives in a ref
   // so applyEssDynamics() can mutate without rerendering 60×/s.
   const essStateRef = useRef(new Map());
+  // Two-step demolish arming. A same-type click on an existing building only
+  // demolishes if it follows another click on the SAME tile within the
+  // window. Prevents accidental teardown while panning the camera.
+  const pendingSellRef = useRef({ key: null, time: 0 });
+  const SELL_CONFIRM_WINDOW_MS = 1500;
   // Best run loaded once on mount from localStorage; we only WRITE on reset
   // (= end of a run) so we don't thrash storage every frame.
   const [leaderboard, setLeaderboard] = useState(() => {
@@ -2094,6 +2455,21 @@ export default function GridBuilder3D() {
           scoreRef.current += dMWh;
           moneyRef.current += dMWh * INCOME_PER_MWH * incomeMult;
         }
+        // 햇빛소득마을 ongoing payout — scales with total panels across all
+        // villages, gated on each village having ≥half its panels powered
+        // (otherwise the cluster isn't really "operating").
+        const villages = sunshineVillagesRef.current;
+        if (villages.length > 0) {
+          let panelsOperating = 0;
+          for (const v of villages) {
+            let lit = 0;
+            for (const mk of v.members) if (s.powered[mk]) lit++;
+            if (lit * 2 >= v.count) panelsOperating += v.count;
+          }
+          if (panelsOperating > 0) {
+            moneyRef.current += panelsOperating * SUNSHINE_INCOME_PER_PANEL_PER_SEC * dt;
+          }
+        }
       }
 
       const targetRadius = radiusForScore(scoreRef.current);
@@ -2113,6 +2489,35 @@ export default function GridBuilder3D() {
         if (eventsRef.current[i].endTime <= now) { hasExpired = true; break; }
       }
       if (hasExpired) {
+        // 지장전주 timeout — if a pole_obstruction expires without being
+        // relocated, the pole is silently demolished (the construction
+        // crew took it down anyway) AND the player eats a steep penalty
+        // for not handling the request.
+        const expiredObstructions = eventsRef.current.filter(
+          (e) => e.type === 'pole_obstruction' && e.endTime <= now,
+        );
+        if (expiredObstructions.length > 0) {
+          const polesToRemove = new Set();
+          let totalPenalty = 0;
+          for (const e of expiredObstructions) {
+            if (e.target && buildingsRef.current.has(e.target)) {
+              polesToRemove.add(e.target);
+              totalPenalty += OBSTRUCTION_TIMEOUT_PENALTY;
+            }
+          }
+          if (polesToRemove.size > 0) {
+            setBuildings((prev) => {
+              const next = new Map(prev);
+              for (const k of polesToRemove) next.delete(k);
+              return next;
+            });
+            moneyRef.current = Math.max(MONEY_FLOOR, moneyRef.current - totalPenalty);
+            setToast({
+              msg: `🚧 지장전주 미이설 ${polesToRemove.size}건 — 전신주 강제 철거 · −₩${totalPenalty.toLocaleString()}`,
+              until: now + 3600,
+            });
+          }
+        }
         setEvents((prev) => prev.filter((e) => e.endTime > now));
       }
 
@@ -2168,6 +2573,11 @@ export default function GridBuilder3D() {
               startTime: now,
               endTime: now + pick.duration * 1000,
             };
+            // 지장전주 — attach a real-world cause so the marker can
+            // display the right icon and the relocation payout differs.
+            if (pick.type === 'pole_obstruction') {
+              ev.obstructionKind = OBSTRUCTION_KINDS[Math.floor(Math.random() * OBSTRUCTION_KINDS.length)];
+            }
             setEvents((prev) => [...prev, ev]);
             const def = EVENT_DEFS[pick.type];
             // If the fault landed on a redundant edge, surface 부하절체.
@@ -2230,6 +2640,55 @@ export default function GridBuilder3D() {
 
   const onTileClick = (q, r) => {
     const k = hexKey(q, r);
+
+    // ────── Relocation mode: target hex selected ──────
+    // If we're in pole-relocation mode, the next valid tile click moves the
+    // obstructed pole there. Validation mirrors RelocationTargets so the
+    // player sees green halos exactly where they can click.
+    if (relocationMode) {
+      const { eventId, fromKey, fromQ, fromR, obstructionKind } = relocationMode;
+      const d = hexDistance(fromQ, fromR, q, r);
+      if (d === 0) {
+        // Clicking the source pole cancels the relocation.
+        setRelocationMode(null);
+        setToast({ msg: '🚧 이설 취소', until: performance.now() + 1400 });
+        return;
+      }
+      const target = buildings.get(k);
+      const targetTerrain = terrainByKey.get(k) || null;
+      const valid = d <= OBSTRUCTION_RELOCATE_RANGE
+        && !target
+        && canBuildOn(targetTerrain, 'utilityPole');
+      if (!valid) {
+        setToast({
+          msg: '🚧 이설 가능 위치(녹색 후광)를 선택하세요',
+          until: performance.now() + 1800,
+        });
+        return;
+      }
+      // Move the pole + dismiss the event + apply per-cause payout.
+      const info = OBSTRUCTION_INFO[obstructionKind] || OBSTRUCTION_INFO.private_land;
+      setBuildings((prev) => {
+        const next = new Map(prev);
+        const old = next.get(fromKey);
+        if (!old) return prev;
+        next.delete(fromKey);
+        next.set(k, { ...old, q, r });
+        return next;
+      });
+      setEvents((prev) => prev.filter((e) => e.id !== eventId));
+      moneyRef.current = info.reward >= 0
+        ? moneyRef.current + info.reward
+        : Math.max(MONEY_FLOOR, moneyRef.current + info.reward);
+      setRelocationMode(null);
+      const sign = info.reward >= 0 ? '+' : '−';
+      setToast({
+        msg: `${info.emoji} ${info.label} 이설 완료 · ${sign}₩${Math.abs(info.reward).toLocaleString()}`,
+        until: performance.now() + 2400,
+      });
+      return;
+    }
+
     // Click-to-dismiss for building-targeted events that the player can
     // physically respond to: shoo away a crow, drop a fire crew on a wildfire.
     // (Lightning is instant — nothing to click on. Helicopter is line-side, so
@@ -2247,19 +2706,36 @@ export default function GridBuilder3D() {
     }
 
     const existing = buildings.get(k);
-    // Same-type click on an existing building = demolish + 60% refund.
-    // This is the player's escape valve when money runs out — sell off
-    // unprofitable infrastructure to climb back to solvency.
+    // Same-type click on an existing building = demolish + 60% refund —
+    // BUT requires a second confirming click on the same tile within
+    // SELL_CONFIRM_WINDOW_MS. Without this, dragging the camera over an
+    // existing building (which counts as a click on touch devices) would
+    // silently demolish it, which was happening on mobile.
     if (existing && existing.type === selected) {
-      const refund = Math.floor((existing.cost || 0) * DEMOLISH_REFUND);
-      if (refund > 0) {
-        moneyRef.current += refund;
+      const now = performance.now();
+      const pending = pendingSellRef.current;
+      const isConfirm = pending.key === k && (now - pending.time) < SELL_CONFIRM_WINDOW_MS;
+      if (!isConfirm) {
+        // First click — arm the sell, surface a "tap again" toast so the
+        // player understands the new behaviour.
+        pendingSellRef.current = { key: k, time: now };
+        const def = TILE_TYPES[existing.type];
+        const refundPreview = Math.floor((existing.cost || 0) * DEMOLISH_REFUND);
+        setToast({
+          msg: `🔻 한 번 더 ${def?.label || '설비'} 클릭 시 매각 (환불 ₩${refundPreview.toLocaleString()})`,
+          until: now + SELL_CONFIRM_WINDOW_MS,
+        });
+        return;
       }
+      // Second click within the window — execute the demolition.
+      const refund = Math.floor((existing.cost || 0) * DEMOLISH_REFUND);
+      if (refund > 0) moneyRef.current += refund;
       setBuildings((prev) => {
         const next = new Map(prev);
         next.delete(k);
         return next;
       });
+      pendingSellRef.current = { key: null, time: 0 };
       const def = TILE_TYPES[existing.type];
       setToast({
         msg: refund > 0
@@ -2360,6 +2836,8 @@ export default function GridBuilder3D() {
     freqRef.current = NOMINAL_FREQ;
     radiusRef.current = INITIAL_RADIUS;
     essStateRef.current = new Map();
+    achievedVillagesRef.current = new Set();
+    setRelocationMode(null);
     setMapRadius(INITIAL_RADIUS);
   };
 
@@ -2407,6 +2885,27 @@ export default function GridBuilder3D() {
         until: performance.now() + 1800,
       });
     }
+  };
+
+  // Enter relocation mode when the player clicks a 지장전주 marker. The
+  // pole stays where it is until the player picks a destination hex (or
+  // clicks the same pole again to cancel).
+  const onObstructionMarkerClick = (ev) => {
+    if (!ev || ev.type !== 'pole_obstruction' || !ev.target) return;
+    const b = buildingsRef.current.get(ev.target);
+    if (!b) return;
+    setRelocationMode({
+      eventId: ev.id,
+      fromKey: ev.target,
+      fromQ: b.q,
+      fromR: b.r,
+      obstructionKind: ev.obstructionKind || 'private_land',
+    });
+    const info = OBSTRUCTION_INFO[ev.obstructionKind || 'private_land'];
+    setToast({
+      msg: `🚧 ${info.label} — 녹색 후광 위치 클릭해 이설`,
+      until: performance.now() + 2600,
+    });
   };
 
   // Dispatch a repair crew from the nearest substation to a faulted line.
@@ -2467,10 +2966,14 @@ export default function GridBuilder3D() {
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
       <Canvas
         camera={{ position: [10, 14, 14], fov: 35 }}
-        dpr={1}
+        // Mobile: DPR pinned at 1, no MSAA, 30 fps cap → measurably cooler
+        // device. Desktop: DPR up to 2 for retina sharpness, MSAA on,
+        // unthrottled — the desktop GPU eats this for breakfast.
+        dpr={IS_MOBILE ? MOBILE_DPR : DESKTOP_DPR}
         flat
+        frameloop="always"
         gl={{
-          antialias: false,
+          antialias: !IS_MOBILE,
           powerPreference: 'high-performance',
           stencil: false,
           depth: true,
@@ -2498,6 +3001,11 @@ export default function GridBuilder3D() {
           onLeaveEdge={onLeaveEdge}
           onToggleRedundant={onToggleRedundant}
           dcStatuses={dcStatuses}
+          sunshineVillages={sunshineVillages}
+          obstructionEvents={obstructionEvents}
+          relocationMode={relocationMode}
+          onObstructionMarkerClick={onObstructionMarkerClick}
+          terrainByKey={terrainByKey}
         />
       </Canvas>
       <UI
@@ -2519,6 +3027,7 @@ export default function GridBuilder3D() {
         redundantCount={redundantEdges.size}
         leaderboard={leaderboard}
         workers={workers}
+        sunshineVillages={sunshineVillages}
       />
     </div>
   );
@@ -2775,7 +3284,7 @@ function detectRadialSubstations(buildings, edges) {
 // should take right now and presents it as a tip. Priority is fixed: safety
 // (블랙아웃) > 사고 (정전·자금) > 계통 안정 (주파수·미점등) > 운영 팁. We render
 // only the top-priority tip to avoid an info wall.
-function operatingAdvice({ freq, money, faults, workers, buildings, powered, count, edges, events }) {
+function operatingAdvice({ freq, money, faults, workers, buildings, powered, count, edges, events, sunshineVillages }) {
   const dev = Math.abs(freq - NOMINAL_FREQ);
   const high = freq > NOMINAL_FREQ;
 
@@ -2818,6 +3327,17 @@ function operatingAdvice({ freq, money, faults, workers, buildings, powered, cou
       icon: '🔥',
       title: `산불 ${wildfires.length}건 진행 중`,
       body: '불타는 송전탑을 클릭하면 진화 헬기를 투입합니다. 방치하면 15초 뒤 자연 진화되지만 그동안 송전탑은 절연 파괴로 정전입니다.',
+    };
+  }
+
+  // Pole obstruction notices — relocation work outstanding.
+  const obstructions = (events || []).filter((e) => e.type === 'pole_obstruction');
+  if (obstructions.length > 0) {
+    return {
+      level: 'warning',
+      icon: '🚧',
+      title: `지장전주 ${obstructions.length}건 — 이설 필요`,
+      body: '🚧 콘 마커를 클릭하고, 녹색 후광이 뜬 인접 헥스를 다시 클릭해 전신주를 이설하세요. 도로 확장은 보상이, 사유지는 이설비가 발생합니다. 방치하면 전신주가 강제 철거됩니다.',
     };
   }
 
@@ -2876,6 +3396,22 @@ function operatingAdvice({ freq, money, faults, workers, buildings, powered, cou
     };
   }
 
+  // Sunshine village hint — player has enough solars but they're too far
+  // apart to cluster. Suggests pulling them together so the achievement
+  // triggers. Skipped when at least one village already exists.
+  if ((!sunshineVillages || sunshineVillages.length === 0) && buildings) {
+    let solarCount = 0;
+    for (const [, b] of buildings) if (b.type === 'solar') solarCount++;
+    if (solarCount >= 3) {
+      return {
+        level: 'info',
+        icon: '☀️',
+        title: `태양광 ${solarCount}기 — 단지 미형성`,
+        body: '햇빛소득마을 단지 보너스를 받으려면 태양광 3기 이상을 서로 가까이(인접 2~3 헥스 이내) 모아 설치하세요. 단지가 완성되면 황금 광주(光柱)와 함께 일회 보너스 + 패널당 분당 수익이 들어옵니다.',
+      };
+    }
+  }
+
   // Radial substations — educational nudge toward 환상망 topology
   const radial = detectRadialSubstations(buildings, edges || []);
   if (radial > 0) {
@@ -2903,36 +3439,55 @@ const ADVISOR_STYLES = {
   info:     { border: 'rgba(125,184,255,0.4)', bg: 'rgba(12,16,32,0.88)', titleColor: '#7fc8ff' },
 };
 
-function OperatingAdvisor({ tip }) {
+function OperatingAdvisor({ tip, compact }) {
   const s = ADVISOR_STYLES[tip.level] || ADVISOR_STYLES.info;
+  // On compact viewports the advisor folds to title + icon only (tap to
+  // expand). Saves vertical real estate next to the bottom palette which
+  // would otherwise overlap. The body is reachable through the toast or
+  // by switching to landscape PC.
+  const [expanded, setExpanded] = useState(false);
+  const showBody = !compact || expanded;
+  const showHint = !compact;
   return (
     <div
+      onClick={() => compact && setExpanded((v) => !v)}
       style={{
-        position: 'absolute', top: 60, left: 12,
+        position: 'absolute',
+        top: compact ? 48 : 60,
+        left: compact ? 6 : 12,
         background: s.bg, color: '#e6f0ff',
-        padding: '12px 14px', borderRadius: 8,
-        fontFamily: 'system-ui', fontSize: 12, maxWidth: 320,
-        lineHeight: 1.55, border: `1px solid ${s.border}`,
+        padding: compact ? '6px 10px' : '12px 14px',
+        borderRadius: 8,
+        fontFamily: 'system-ui',
+        fontSize: compact ? 11 : 12,
+        maxWidth: compact ? 220 : 320,
+        lineHeight: 1.5,
+        border: `1px solid ${s.border}`,
         boxShadow: tip.level === 'critical'
           ? `0 0 18px ${s.border}` : 'none',
         transition: 'background 0.3s, border-color 0.3s',
+        cursor: compact ? 'pointer' : 'default',
       }}
     >
       <div style={{
-        color: s.titleColor, fontWeight: 700, fontSize: 13,
-        display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4,
+        color: s.titleColor, fontWeight: 700,
+        fontSize: compact ? 12 : 13,
+        display: 'flex', alignItems: 'center', gap: 6,
+        marginBottom: showBody ? 4 : 0,
       }}>
-        <span style={{ fontSize: 16 }}>{tip.icon}</span>
+        <span style={{ fontSize: compact ? 14 : 16 }}>{tip.icon}</span>
         <span>{tip.title}</span>
       </div>
-      <div style={{ opacity: 0.92 }}>{tip.body}</div>
-      <div style={{
-        marginTop: 8, paddingTop: 6,
-        borderTop: '1px solid rgba(255,255,255,0.08)',
-        fontSize: 10, opacity: 0.55,
-      }}>
-        🖱️ 클릭=배치 · 같은 타입 클릭=철거(60% 환불) · 드래그=회전 · 휠=줌
-      </div>
+      {showBody && <div style={{ opacity: 0.92 }}>{tip.body}</div>}
+      {showHint && (
+        <div style={{
+          marginTop: 8, paddingTop: 6,
+          borderTop: '1px solid rgba(255,255,255,0.08)',
+          fontSize: 10, opacity: 0.55,
+        }}>
+          🖱️ 클릭=배치 · 같은 타입 두 번 클릭=철거(60% 환불) · 드래그=회전 · 휠=줌
+        </div>
+      )}
     </div>
   );
 }
@@ -3111,9 +3666,10 @@ function LeaderboardPanel({ entries, currentScore, currentPlaytime, currentMoney
 function UI({
   selected, setSelected, sim, dyn, mapRadius, toast, events, windActive, onReset, count,
   hovered, terrainByKey, landValueByKey, buildings,
-  hoveredEdge, redundantCount, leaderboard, workers,
+  hoveredEdge, redundantCount, leaderboard, workers, sunshineVillages,
 }) {
   const [showBoard, setShowBoard] = useState(false);
+  const compact = useIsCompact();
 
   // Live advisor tip — recomputed whenever the relevant slice of state moves.
   // Deps kept narrow so we don't churn the tip every dyn pulse.
@@ -3132,8 +3688,9 @@ function UI({
       count,
       edges: sim.edges,
       events,
+      sunshineVillages,
     }),
-    [dyn.freq, dyn.money, faultEvents, workers, buildings, sim.powered, count, sim.edges, events],
+    [dyn.freq, dyn.money, faultEvents, workers, buildings, sim.powered, count, sim.edges, events, sunshineVillages],
   );
   // Hover tooltip data — depends on the currently hovered hex.
   const hoverInfo = useMemo(() => {
@@ -3166,13 +3723,21 @@ function UI({
 
   return (
     <>
-      {/* Top-right HUD */}
+      {/* Top-right HUD — compact mode shrinks widths and padding so the
+          panel doesn't fight the bottom palette for screen real estate
+          on small landscapes (or CSS-rotated portrait phones). */}
       <div
         style={{
-          position: 'absolute', top: 12, right: 12,
+          position: 'absolute',
+          top: compact ? 6 : 12,
+          right: compact ? 6 : 12,
           background: 'rgba(12,16,32,0.88)', color: '#e6f7ff',
-          padding: 14, borderRadius: 10,
-          fontFamily: 'system-ui', fontSize: 13, minWidth: 260,
+          padding: compact ? 8 : 14,
+          borderRadius: 10,
+          fontFamily: 'system-ui',
+          fontSize: compact ? 11 : 13,
+          minWidth: compact ? 190 : 260,
+          maxWidth: compact ? 220 : undefined,
           border: '1px solid #2a3a5e',
           backdropFilter: 'blur(8px)',
         }}
@@ -3398,7 +3963,7 @@ function UI({
       )}
 
       {/* Top-left advisor — live tip based on current grid state */}
-      <OperatingAdvisor tip={advisorTip} />
+      <OperatingAdvisor tip={advisorTip} compact={compact} />
 
       {/* Leaderboard overlay — toggled by the 🏆 button in the RANK card. */}
       {showBoard && (
@@ -3426,13 +3991,18 @@ function UI({
           one in the same run. */}
       <div
         style={{
-          position: 'absolute', bottom: 14, left: '50%',
+          position: 'absolute',
+          bottom: compact ? 6 : 14,
+          left: '50%',
           transform: 'translateX(-50%)',
           background: 'rgba(12,16,32,0.92)',
-          padding: '8px 12px', borderRadius: 14,
+          padding: compact ? '4px 6px' : '8px 12px',
+          borderRadius: 14,
           fontFamily: 'system-ui',
-          display: 'flex', gap: 12, alignItems: 'stretch',
-          maxWidth: '96vw',
+          display: 'flex',
+          gap: compact ? 6 : 12,
+          alignItems: 'stretch',
+          maxWidth: '98vw',
           overflowX: 'auto',
           border: '1px solid #2a3a5e',
           backdropFilter: 'blur(8px)',
@@ -3445,6 +4015,7 @@ function UI({
           keys={TRADITIONAL_KEYS}
           selected={selected}
           setSelected={setSelected}
+          compact={compact}
         />
         <div style={{ width: 1, background: 'rgba(125,184,255,0.25)' }} />
         <PaletteGroup
@@ -3454,6 +4025,7 @@ function UI({
           keys={SMART_GRID_KEYS}
           selected={selected}
           setSelected={setSelected}
+          compact={compact}
         />
         <div style={{ width: 1, background: 'rgba(200,120,255,0.25)' }} />
         <PaletteGroup
@@ -3463,6 +4035,7 @@ function UI({
           keys={SPECIAL_KEYS}
           selected={selected}
           setSelected={setSelected}
+          compact={compact}
         />
       </div>
     </>
@@ -3474,21 +4047,26 @@ function UI({
 // the special-facility group off-screen on narrower monitors. Uniform width
 // + label-only ellipsis is the simplest fix.
 const PALETTE_CARD_WIDTH = 88;
-function PaletteGroup({ title, subtitle, accent, keys, selected, setSelected }) {
+const PALETTE_CARD_WIDTH_COMPACT = 62;
+function PaletteGroup({ title, subtitle, accent, keys, selected, setSelected, compact }) {
+  const cardWidth = compact ? PALETTE_CARD_WIDTH_COMPACT : PALETTE_CARD_WIDTH;
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: compact ? 2 : 4 }}>
       <div style={{
-        fontSize: 10, letterSpacing: 1, color: accent, fontWeight: 700,
+        fontSize: compact ? 9 : 10, letterSpacing: 1, color: accent, fontWeight: 700,
         display: 'flex', alignItems: 'baseline', gap: 6,
         whiteSpace: 'nowrap', overflow: 'hidden',
       }}>
         <span>{title}</span>
-        <span style={{
-          opacity: 0.5, fontWeight: 400, fontSize: 9,
-          textOverflow: 'ellipsis', overflow: 'hidden',
-        }}>{subtitle}</span>
+        {/* subtitle is space-expensive — hide on compact */}
+        {!compact && (
+          <span style={{
+            opacity: 0.5, fontWeight: 400, fontSize: 9,
+            textOverflow: 'ellipsis', overflow: 'hidden',
+          }}>{subtitle}</span>
+        )}
       </div>
-      <div style={{ display: 'flex', gap: 6 }}>
+      <div style={{ display: 'flex', gap: compact ? 4 : 6 }}>
         {keys.map((k) => {
           const def = TILE_TYPES[k];
           const active = selected === k;
@@ -3497,16 +4075,16 @@ function PaletteGroup({ title, subtitle, accent, keys, selected, setSelected }) 
               key={k}
               onClick={() => setSelected(k)}
               style={{
-                padding: '8px 6px',
+                padding: compact ? '5px 3px' : '8px 6px',
                 background: active ? def.color : 'transparent',
                 color: active ? '#0a0e27' : '#e6f7ff',
                 border: `1.5px solid ${def.color}`,
                 borderRadius: 10,
                 cursor: 'pointer',
                 fontWeight: active ? 700 : 500,
-                fontSize: 12,
+                fontSize: compact ? 11 : 12,
                 whiteSpace: 'nowrap',
-                width: PALETTE_CARD_WIDTH,
+                width: cardWidth,
                 textAlign: 'center',
                 boxShadow: active ? `0 0 16px ${def.color}55` : 'none',
                 transition: 'all 0.15s',
@@ -3514,13 +4092,18 @@ function PaletteGroup({ title, subtitle, accent, keys, selected, setSelected }) 
               }}
               title={def.desc /* full desc on hover */}
             >
-              <div style={{ fontSize: 13 }}>{def.label}</div>
-              <div style={{
-                fontSize: 10, opacity: 0.78, marginTop: 3,
-                overflow: 'hidden', textOverflow: 'ellipsis',
-              }}>
-                {def.desc}
+              <div style={{ fontSize: compact ? 11 : 13, fontWeight: active ? 700 : 600 }}>
+                {def.label}
               </div>
+              {/* desc is the major width-eater — drop on compact */}
+              {!compact && (
+                <div style={{
+                  fontSize: 10, opacity: 0.78, marginTop: 3,
+                  overflow: 'hidden', textOverflow: 'ellipsis',
+                }}>
+                  {def.desc}
+                </div>
+              )}
             </button>
           );
         })}
