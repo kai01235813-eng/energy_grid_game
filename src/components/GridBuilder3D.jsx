@@ -2885,6 +2885,66 @@ export default function GridBuilder3D() {
     }
   };
 
+  // Tutorial-driven event spawn. Used by the interactive coach so each
+  // fault-response step actually demonstrates its incident. Returns true
+  // on success, false if there's no valid target (e.g., player skipped
+  // ahead before placing a pylon for lightning). The event uses the same
+  // event-id pool + state shape as the random spawner so the rest of the
+  // game (drain, advisor, repair flow) treats it identically.
+  const spawnTutorialEvent = (type) => {
+    const buildings = buildingsRef.current;
+    const sim = simRef.current;
+    const def = EVENT_DEFS[type];
+    if (!def) return false;
+    let target = null;
+    const extras = {};
+    if (type === 'crow') {
+      const pool = [...buildings.entries()].filter(
+        ([, b]) => b.type === 'pylon' || b.type === 'utilityPole',
+      );
+      if (pool.length === 0) return false;
+      target = pool[Math.floor(Math.random() * pool.length)][0];
+    } else if (type === 'wildfire' || type === 'lightning') {
+      const pool = [...buildings.entries()].filter(([, b]) => b.type === 'pylon');
+      if (pool.length === 0) return false;
+      target = pool[Math.floor(Math.random() * pool.length)][0];
+    } else if (type === 'line_fault') {
+      if (!sim.edges || sim.edges.length === 0) return false;
+      const [a, b] = sim.edges[Math.floor(Math.random() * sim.edges.length)];
+      target = edgeKey(a, b);
+    } else if (type === 'helicopter') {
+      const pylonEdges = (sim.edges || []).filter(
+        ([a, b]) => buildings.get(a)?.type === 'pylon' && buildings.get(b)?.type === 'pylon',
+      );
+      const pool = pylonEdges.length > 0 ? pylonEdges : (sim.edges || []);
+      if (pool.length === 0) return false;
+      const [a, b] = pool[Math.floor(Math.random() * pool.length)];
+      target = edgeKey(a, b);
+    } else if (type === 'pole_obstruction') {
+      const pool = [...buildings.entries()].filter(([, b]) => b.type === 'utilityPole');
+      if (pool.length === 0) return false;
+      target = pool[Math.floor(Math.random() * pool.length)][0];
+      extras.obstructionKind = OBSTRUCTION_KINDS[Math.floor(Math.random() * OBSTRUCTION_KINDS.length)];
+    } else {
+      return false;
+    }
+    const now = performance.now();
+    const ev = {
+      id: nextEventId(),
+      type,
+      target,
+      startTime: now,
+      endTime: now + def.duration * 1000,
+      ...extras,
+    };
+    setEvents((prev) => [...prev, ev]);
+    setToast({
+      msg: `${def.emoji} 튜토리얼 — ${def.label} 시연`,
+      until: now + 2400,
+    });
+    return true;
+  };
+
   // Enter relocation mode when the player clicks a 지장전주 marker. The
   // pole stays where it is until the player picks a destination hex (or
   // clicks the same pole again to cancel).
@@ -3029,6 +3089,7 @@ export default function GridBuilder3D() {
         leaderboard={leaderboard}
         workers={workers}
         sunshineVillages={sunshineVillages}
+        onSpawnTutorialEvent={spawnTutorialEvent}
       />
     </div>
   );
@@ -3658,82 +3719,95 @@ const INTERACTIVE_STEPS = [
     body: (
       '실생활 발전기는 부하 변동에 즉시 따라가지 못해 주파수가 출렁입니다. 스마트그리드 설비가 이걸 자동으로 잡아 줍니다.<br/><br/>'
       + '<b>① 태양광·풍력 (출력제어 / curtailment)</b><br/>'
-      + '공급이 수요를 초과하면 인버터가 출력을 스스로 깎습니다. 신재생을 잔뜩 지어도 주파수가 위로 폭주하지 않는 이유입니다.<br/><br/>'
+      + '공급이 수요를 초과하면 인버터가 출력을 스스로 깎습니다.<br/><br/>'
       + '<b>② ESS (자동 충·방전)</b><br/>'
       + '• 주파수 <b>60 Hz 위로 상승 → 충전</b> (잉여 흡수)<br/>'
       + '• 주파수 <b>60 Hz 아래로 하강 → 방전</b> (부족 보충)<br/>'
       + '변전소·전신주·데이터센터 옆에 두면 자동 작동합니다.<br/><br/>'
-      + '<b>실전 팁</b>: 사고·날씨 변동에 강한 그리드를 원한다면 <b>신재생 + ESS 조합</b>이 핵심. 콤보 보너스 유지에도 결정적.'
+      + '<b>지금 해보기</b>: <b>태양광 · 풍력 · ESS 중 하나</b>를 설치하세요. 설치 완료 시 자동으로 다음 단계로 넘어갑니다.'
     ),
     info: true,
+    requiresOneOf: ['solar', 'wind', 'ess'],
   },
   {
     icon: '🐦',
     title: '사고 대응 ① · 까마귀 트립',
     body: (
-      '<b>발생 위치</b>: 송전탑·전신주 (전신주에 4배 자주 — 22.9 kV 배전선에 까마귀가 많음)<br/>'
+      '<b>지금 발생!</b> 송전탑·전신주 1기에 까마귀가 앉았습니다.<br/><br/>'
       + '<b>피해</b>: 해당 설비가 9초간 작동 불능 → 다운스트림 정전 가능<br/>'
-      + '<b>조치</b>: 까마귀가 보이는 설비를 직접 <b>탭</b>해서 쫓기.<br/>'
-      + '<b>방치 시</b>: 9초 후 자동 dismiss (정전 동안 점등된 가정 수익 손실)'
+      + '<b>조치</b>: 까마귀가 보이는 설비를 직접 <b>탭</b>해서 쫓아 보세요.<br/>'
+      + '<b>방치 시</b>: 9초 후 자동 dismiss (정전 동안 점등된 가정 수익 손실)<br/><br/>'
+      + '<i>까마귀를 쫓으면 자동으로 다음 단계로 넘어갑니다.</i>'
     ),
     info: true,
+    requiresEventType: 'crow',
   },
   {
     icon: '🔥',
     title: '사고 대응 ② · 산불',
     body: (
-      '<b>발생 위치</b>: 송전탑 1기<br/>'
-      + '<b>피해</b>: 절연 파괴로 송전탑이 15초간 작동 불능 + 사고 처리비 즉시 <b>−₩300</b><br/>'
+      '<b>지금 발생!</b> 송전탑 1기에 산불이 났습니다.<br/><br/>'
+      + '<b>피해</b>: 절연 파괴로 송전탑 15초간 작동 불능 + 사고 처리비 <b>−₩300</b><br/>'
       + '<b>조치</b>: 불타는 송전탑을 <b>탭</b>해 진화 헬기 투입.<br/>'
-      + '<b>방치 시</b>: 15초 후 자연 진화. 그동안 다운스트림 정전 + 정전 드레인 추가'
+      + '<b>방치 시</b>: 15초 후 자연 진화. 그동안 다운스트림 정전 + 추가 드레인<br/><br/>'
+      + '<i>진화하면 자동으로 다음 단계로 넘어갑니다.</i>'
     ),
     info: true,
+    requiresEventType: 'wildfire',
   },
   {
     icon: '⚡',
     title: '사고 대응 ③ · 낙뢰',
     body: (
-      '<b>발생 위치</b>: 송전탑 1기<br/>'
+      '<b>지금 발생!</b> 송전탑에 번개가 쳤습니다.<br/><br/>'
       + '<b>피해</b>: 3초간 즉시 트립 + 즉시 사고 처리비 <b>−₩350</b><br/>'
       + '<b>조치</b>: 자동 회복. 클릭으로 막을 수 없음 — "운"의 영역.<br/>'
-      + '<b>예방</b>: 핵심 송전 백본을 이중화하면 다운스트림 정전을 막을 수 있음'
+      + '<b>예방</b>: 핵심 송전 백본을 이중화하면 다운스트림 정전을 막을 수 있음<br/><br/>'
+      + '<i>3초 후 자동 회복되면 다음 단계로 넘어갑니다.</i>'
     ),
     info: true,
+    requiresEventType: 'lightning',
   },
   {
     icon: '🔧',
     title: '사고 대응 ④ · 설비 고장 (선로 고장)',
     body: (
-      '<b>발생 위치</b>: 모든 전력 회선<br/>'
-      + '<b>피해</b>: 즉시 <b>−₩200</b> + 정전 소비처가 있으면 지속 드레인 (보호협조로 그리드 전체 정전은 막힘)<br/>'
-      + '<b>조치</b>: 회선 위의 <b>⚠ 마커를 탭</b> → 가장 가까운 변전소에서 복구반(안전모 작업자) 출동 → 휴전 작업 5초 → 복구.<br/>'
-      + '<b>예방</b>: 송전탑↔송전탑 회선의 가운데 점 클릭으로 <b>이중화(N-1)</b> → 부하절체 무중단'
+      '<b>지금 발생!</b> 전력 회선 한 구간에 고장이 발생했습니다.<br/><br/>'
+      + '<b>피해</b>: 즉시 <b>−₩200</b> + 정전 소비처가 있으면 지속 드레인 (보호협조로 전체 정전은 막힘)<br/>'
+      + '<b>조치</b>: 회선 위의 <b>⚠ 마커를 탭</b> → 가장 가까운 변전소에서 복구반 출동 → 휴전 작업 5초 → 복구.<br/>'
+      + '<b>예방</b>: 송전탑↔송전탑 회선의 가운데 점 클릭으로 <b>이중화(N-1)</b><br/><br/>'
+      + '<i>복구반 작업이 끝나면 자동으로 다음 단계로 넘어갑니다.</i>'
     ),
     info: true,
+    requiresEventType: 'line_fault',
   },
   {
     icon: '🚁',
     title: '사고 대응 ⑤ · 헬기 추락',
     body: (
-      '<b>발생 위치</b>: 송전탑↔송전탑 154 kV 백본 회선 (낮은 비행 점검·수송 헬기 접촉)<br/>'
+      '<b>지금 발생!</b> 154 kV 백본 회선에 헬기가 추락했습니다.<br/><br/>'
       + '<b>피해</b>: 즉시 <b>−₩500</b> (게임 내 가장 비싼 사고) + 검은 연기 시각화<br/>'
-      + '<b>조치</b>: 선로 고장과 동일 — <b>⚠ 마커를 탭</b>해 복구반 출동.<br/>'
-      + '<b>특징</b>: 빈도는 낮지만 회복 안 하면 사고 처리비가 너무 큼. 우선 대응'
+      + '<b>조치</b>: 회선의 <b>⚠ 마커를 탭</b>해 복구반 출동 (선로 고장과 동일 절차).<br/>'
+      + '<b>특징</b>: 빈도는 낮지만 회복 안 하면 사고 처리비가 너무 큼. 우선 대응<br/><br/>'
+      + '<i>복구반이 도착·작업하면 자동으로 다음 단계로 넘어갑니다.</i>'
     ),
     info: true,
+    requiresEventType: 'helicopter',
   },
   {
     icon: '🚧',
     title: '사고 대응 ⑥ · 지장전주 이설',
     body: (
-      '<b>발생 위치</b>: 기존 전신주 1기 (현실 사유: 도로 확장·사유지 재산권·건축 진출입)<br/>'
+      '<b>지금 발생!</b> 전신주 1기에 이설 요청이 들어왔습니다.<br/><br/>'
       + '<b>피해</b>: 28초 안에 이설 안 하면 강제 철거 + <b>−₩400</b> + 다운스트림 정전<br/>'
       + '<b>조치 (2단계)</b>:<br/>'
       + '&nbsp;&nbsp;1) 콘 모양 마커를 <b>탭</b> → 주변 인접 헥스에 <b>녹색 후광</b> 표시<br/>'
       + '&nbsp;&nbsp;2) 녹색 후광 헥스를 <b>탭</b> → 전신주 이설 완료<br/>'
-      + '<b>케이스별 정산</b>: 🛣 도로 확장 <b>+₩500</b>, 🏠 사유지 <b>−₩150</b>, 🚗 건축 <b>+₩300</b>'
+      + '<b>케이스별 정산</b>: 🛣 도로 확장 <b>+₩500</b>, 🏠 사유지 <b>−₩150</b>, 🚗 건축 <b>+₩300</b><br/><br/>'
+      + '<i>이설 완료 시 자동으로 다음 단계로 넘어갑니다.</i>'
     ),
     info: true,
+    requiresEventType: 'pole_obstruction',
   },
 ];
 
@@ -4194,6 +4268,7 @@ function UI({
   selected, setSelected, sim, dyn, mapRadius, toast, events, windActive, onReset, count,
   hovered, terrainByKey, landValueByKey, buildings,
   hoveredEdge, redundantCount, leaderboard, workers, sunshineVillages,
+  onSpawnTutorialEvent,
 }) {
   const [showBoard, setShowBoard] = useState(false);
   const compact = useIsCompact();
@@ -4218,6 +4293,9 @@ function UI({
   // auto-advance even if the build requirement was already satisfied
   // before they went back).
   const coachHighWaterRef = useRef(0);
+  // Per-step "we already triggered the demo event" latch so we don't keep
+  // spawning a new crow every render while the player figures out the step.
+  const tutorialEventSpawnedRef = useRef({});
   const goToStep = (next) => {
     if (next > coachHighWaterRef.current) coachHighWaterRef.current = next;
     setCoachStep(next);
@@ -4226,25 +4304,59 @@ function UI({
   const goPrevCoach  = () => { if (coachStep > 0) goToStep(coachStep - 1); };
   const skipCoach    = () => goToStep(INTERACTIVE_STEPS.length + 1);
 
-  // Auto-advance when the current step's requirement is met. Info steps
-  // (no requirement) wait for the user's explicit "다음 →" tap. Reviewing
-  // a previous step (coachStep < high-water) also skips auto-advance so
-  // the player can actually re-read it.
+  // Fault tutorial steps spawn their demo event on enter. Once the player
+  // resolves the event (or auto-clear fires for lightning), the auto-
+  // advance check below detects it and moves on. Skipped during review
+  // mode so re-visiting a completed step doesn't re-spawn.
   useEffect(() => {
     if (coachStep < 0 || coachStep >= INTERACTIVE_STEPS.length) return;
-    if (coachStep < coachHighWaterRef.current) return; // pure review mode
+    if (coachStep < coachHighWaterRef.current) return;
     const def = INTERACTIVE_STEPS[coachStep];
-    if (!def || def.info) return; // info steps need "다음 →"
+    if (!def || !def.requiresEventType) return;
+    if (tutorialEventSpawnedRef.current[coachStep]) return;
+    if (typeof onSpawnTutorialEvent !== 'function') return;
+    const ok = onSpawnTutorialEvent(def.requiresEventType);
+    if (ok) tutorialEventSpawnedRef.current[coachStep] = true;
+  }, [coachStep, onSpawnTutorialEvent]);
+
+  // Auto-advance when the current step's requirement is met. Logic per
+  // requirement type:
+  //   requiresType / requiresVillage — building count / village formation
+  //   requiresOneOf — at least one of the listed building types exists
+  //   requiresEventType — the demo event was spawned AND has since cleared
+  // Reviewing previous steps (coachStep < high-water) suppresses advance.
+  useEffect(() => {
+    if (coachStep < 0 || coachStep >= INTERACTIVE_STEPS.length) return;
+    if (coachStep < coachHighWaterRef.current) return;
+    const def = INTERACTIVE_STEPS[coachStep];
+    if (!def) return;
     let done = false;
+    let hasReq = false;
     if (def.requiresVillage) {
+      hasReq = true;
       done = (sunshineVillages || []).length > 0;
     } else if (def.requiresType) {
+      hasReq = true;
       let n = 0;
       for (const [, b] of buildings) if (b.type === def.requiresType) n++;
       done = n >= (def.count || 1);
+    } else if (def.requiresOneOf) {
+      hasReq = true;
+      for (const [, b] of buildings) {
+        if (def.requiresOneOf.indexOf(b.type) !== -1) { done = true; break; }
+      }
+    } else if (def.requiresEventType) {
+      hasReq = true;
+      // Only count as done if the event was actually spawned for this
+      // step (otherwise day-zero of the step would auto-skip).
+      if (tutorialEventSpawnedRef.current[coachStep]) {
+        const stillActive = (events || []).some((e) => e.type === def.requiresEventType);
+        done = !stillActive;
+      }
     }
+    if (!hasReq) return; // pure-info step → manual "다음 →"
     if (done) goToStep(coachStep + 1);
-  }, [coachStep, buildings, sunshineVillages]);
+  }, [coachStep, buildings, sunshineVillages, events]);
 
   const showCoachBanner = coachStep >= 0 && coachStep < INTERACTIVE_STEPS.length;
   const showCoachComplete = coachStep === INTERACTIVE_STEPS.length;
