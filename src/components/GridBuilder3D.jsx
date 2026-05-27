@@ -3107,7 +3107,7 @@ function EdgeHoverTooltip({ edge, buildings }) {
   );
 }
 
-function FreqGauge({ freq, targetFreq }) {
+function FreqGauge({ freq, targetFreq, compact }) {
   // Map freq to angle. nominal=60 → 0°. ±FREQ_MAX_DEV → ±90°.
   const norm = Math.max(-1, Math.min(1, (freq - NOMINAL_FREQ) / FREQ_MAX_DEV));
   const angle = norm * 90;
@@ -3140,6 +3140,23 @@ function FreqGauge({ freq, targetFreq }) {
   // player needs to react to.
   const drifting = tAngle != null && Math.abs(tAngle - angle) > 4;
 
+  // Compact: skip the SVG arc/needle entirely. The status colour on the Hz
+  // number + the one-line balance summary below carry the same information.
+  if (compact) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+        <span style={{ color, fontFamily: 'monospace', fontSize: 20, fontWeight: 700, lineHeight: 1 }}>
+          {freq.toFixed(2)}<span style={{ fontSize: 10, opacity: 0.7 }}>Hz</span>
+        </span>
+        <span style={{ color, fontSize: 10 }}>● {label}</span>
+        {drifting && targetFreq != null && (
+          <span style={{ fontSize: 9, color: '#7be6ff' }}>
+            ↗{targetFreq.toFixed(1)}
+          </span>
+        )}
+      </div>
+    );
+  }
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
       <svg width="120" height="78" viewBox="0 0 120 78">
@@ -3875,28 +3892,48 @@ function UI({
           backdropFilter: 'blur(8px)',
         }}
       >
-        <div style={{ color: '#7fc8ff', fontWeight: 700, letterSpacing: 1, fontSize: 11, marginBottom: 8 }}>
-          ⚡ GRID FREQUENCY
-        </div>
-        <FreqGauge freq={dyn.freq} targetFreq={dyn.targetFreq} />
+        {!compact && (
+          <div style={{ color: '#7fc8ff', fontWeight: 700, letterSpacing: 1, fontSize: 11, marginBottom: 8 }}>
+            ⚡ GRID FREQUENCY
+          </div>
+        )}
+        <FreqGauge freq={dyn.freq} targetFreq={dyn.targetFreq} compact={compact} />
 
-        <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid #2a3a5e', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 12px', fontSize: 12 }}>
-          <div style={{ opacity: 0.7 }}>
-            공급
-            {windActive && <span style={{ color: '#9ee8c0', marginLeft: 4 }}>🌪️</span>}
+        {!compact && (
+          <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid #2a3a5e', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 12px', fontSize: 12 }}>
+            <div style={{ opacity: 0.7 }}>
+              공급
+              {windActive && <span style={{ color: '#9ee8c0', marginLeft: 4 }}>🌪️</span>}
+            </div>
+            <div style={{ textAlign: 'right', color: supplyTinted ? '#a0c8ff' : '#ffd16b', fontFamily: 'monospace' }}>
+              {effSupply} MW
+            </div>
+            <div style={{ opacity: 0.7 }}>실효 수요</div>
+            <div style={{ textAlign: 'right', color: '#ff8fb4', fontFamily: 'monospace' }}>{dyn.effDemand.toFixed(0)} MW</div>
+            <div style={{ opacity: 0.7 }}>여유</div>
+            <div style={{ textAlign: 'right', color: balanceColor, fontFamily: 'monospace', fontWeight: 600 }}>
+              {balance >= 0 ? '+' : ''}{balance.toFixed(0)} MW
+            </div>
+            <div style={{ opacity: 0.7 }}>수요 배율</div>
+            <div style={{ textAlign: 'right', color: '#a8d0ff', fontFamily: 'monospace' }}>×{dyn.mult.toFixed(2)}</div>
           </div>
-          <div style={{ textAlign: 'right', color: supplyTinted ? '#a0c8ff' : '#ffd16b', fontFamily: 'monospace' }}>
-            {effSupply} MW
+        )}
+        {/* Compact-mode one-line balance summary — keeps the critical
+            "are we generating enough?" signal without the 4-row table. */}
+        {compact && (
+          <div style={{
+            marginTop: 6, paddingTop: 6, borderTop: '1px solid #2a3a5e',
+            display: 'flex', justifyContent: 'space-between',
+            fontSize: 10, fontFamily: 'monospace',
+          }}>
+            <span style={{ color: '#ffd16b' }}>{effSupply}</span>
+            <span style={{ color: '#7aa' }}>→</span>
+            <span style={{ color: '#ff8fb4' }}>{dyn.effDemand.toFixed(0)}</span>
+            <span style={{ color: balanceColor, fontWeight: 700 }}>
+              {balance >= 0 ? '+' : ''}{balance.toFixed(0)}MW
+            </span>
           </div>
-          <div style={{ opacity: 0.7 }}>실효 수요</div>
-          <div style={{ textAlign: 'right', color: '#ff8fb4', fontFamily: 'monospace' }}>{dyn.effDemand.toFixed(0)} MW</div>
-          <div style={{ opacity: 0.7 }}>여유</div>
-          <div style={{ textAlign: 'right', color: balanceColor, fontFamily: 'monospace', fontWeight: 600 }}>
-            {balance >= 0 ? '+' : ''}{balance.toFixed(0)} MW
-          </div>
-          <div style={{ opacity: 0.7 }}>수요 배율</div>
-          <div style={{ textAlign: 'right', color: '#a8d0ff', fontFamily: 'monospace' }}>×{dyn.mult.toFixed(2)}</div>
-        </div>
+        )}
 
         <div style={{
           marginTop: 10, padding: 10,
@@ -3929,18 +3966,22 @@ function UI({
           }}>
             ₩{Math.floor(dyn.money).toLocaleString()}
           </div>
-          {/* Combo + difficulty meters — small dual progress bars below the
-              fund amount. Combo fills as freq stays stable; difficulty fills
-              as the run survives. Bonus income visible at a glance. */}
-          <div style={{ marginTop: 6, display: 'grid', gap: 4 }}>
-            <ComboMeter combo={dyn.combo || 0} bonus={(dyn.comboMult || 1) - 1} />
-            <DifficultyMeter difficulty={dyn.difficulty || 1} />
-          </div>
-          <div style={{ fontSize: 10, opacity: 0.6, marginTop: 4 }}>
-            {dyn.money < 0
-              ? '같은 타입 클릭으로 설비 철거 시 60% 환불'
-              : '주파수 안정 유지 → 콤보 ↑ → 보너스 수익'}
-          </div>
+          {/* Combo + difficulty meters — hidden on compact since the
+              ×N.NN multiplier next to the FUNDS header already conveys
+              "combo active" without the extra vertical real-estate. */}
+          {!compact && (
+            <div style={{ marginTop: 6, display: 'grid', gap: 4 }}>
+              <ComboMeter combo={dyn.combo || 0} bonus={(dyn.comboMult || 1) - 1} />
+              <DifficultyMeter difficulty={dyn.difficulty || 1} />
+            </div>
+          )}
+          {!compact && (
+            <div style={{ fontSize: 10, opacity: 0.6, marginTop: 4 }}>
+              {dyn.money < 0
+                ? '같은 타입 클릭으로 설비 철거 시 60% 환불'
+                : '주파수 안정 유지 → 콤보 ↑ → 보너스 수익'}
+            </div>
+          )}
         </div>
 
         {/* Playtime + rank score — feeds the leaderboard on reset */}
@@ -3986,20 +4027,27 @@ function UI({
               {Math.floor((dyn.playtime || 0) / 60)}:{String(Math.floor((dyn.playtime || 0) % 60)).padStart(2, '0')}
             </span>
           </div>
-          <div style={{ fontSize: 10, opacity: 0.55, marginTop: 2 }}>
-            ₩ + 5점/초 · 초기화 시 랭킹 등록
-          </div>
+          {!compact && (
+            <div style={{ fontSize: 10, opacity: 0.55, marginTop: 2 }}>
+              ₩ + 5점/초 · 초기화 시 랭킹 등록
+            </div>
+          )}
         </div>
 
-        <div style={{ marginTop: 8, padding: 10, background: 'rgba(255, 216, 107, 0.07)', borderRadius: 6, border: '1px solid rgba(255,216,107,0.3)' }}>
-          <div style={{ fontSize: 10, color: '#ffd86b', letterSpacing: 1 }}>SCORE · 누적 공급량</div>
-          <div style={{ fontSize: 22, fontFamily: 'monospace', color: '#fff6a0', fontWeight: 700, lineHeight: 1.1 }}>
-            {dyn.score.toFixed(2)} <span style={{ fontSize: 11, opacity: 0.7 }}>MWh</span>
+        {/* SCORE · MWh, 마일스톤 진행도, 빌딩 통계는 데스크탑에서만 노출.
+            모바일 컴팩트에서는 HUD 전체 높이가 팔레트와 겹치는 주범이라
+            비핵심 카드를 통째로 숨김. 핵심 지표(주파수·자금·점수)는 유지. */}
+        {!compact && (
+          <div style={{ marginTop: 8, padding: 10, background: 'rgba(255, 216, 107, 0.07)', borderRadius: 6, border: '1px solid rgba(255,216,107,0.3)' }}>
+            <div style={{ fontSize: 10, color: '#ffd86b', letterSpacing: 1 }}>SCORE · 누적 공급량</div>
+            <div style={{ fontSize: 22, fontFamily: 'monospace', color: '#fff6a0', fontWeight: 700, lineHeight: 1.1 }}>
+              {dyn.score.toFixed(2)} <span style={{ fontSize: 11, opacity: 0.7 }}>MWh</span>
+            </div>
+            <div style={{ fontSize: 10, opacity: 0.6, marginTop: 2 }}>주파수가 ±0.5 Hz 안일 때만 적립</div>
           </div>
-          <div style={{ fontSize: 10, opacity: 0.6, marginTop: 2 }}>주파수가 ±0.5 Hz 안일 때만 적립</div>
-        </div>
+        )}
 
-        {nextMilestone !== null && (
+        {!compact && nextMilestone !== null && (
           <div style={{ marginTop: 8, fontSize: 10, opacity: 0.65 }}>
             다음 확장까지 <span style={{ color: '#a0e8b8' }}>{(nextMilestone - dyn.score).toFixed(1)} MWh</span>
             <div style={{ marginTop: 4, height: 3, background: '#1c2640', borderRadius: 2, overflow: 'hidden' }}>
@@ -4012,12 +4060,21 @@ function UI({
             </div>
           </div>
         )}
-        <div style={{ marginTop: 8, fontSize: 11, opacity: 0.55, display: 'flex', justifyContent: 'space-between' }}>
-          <span>
-            건물 {count} · 회선 {sim.edges.length}
-            {redundantCount > 0 && <span style={{ color: '#7be6ff' }}> (이중화 {redundantCount})</span>}
-            {' · '}영역 r{mapRadius}
-          </span>
+        <div style={{
+          marginTop: compact ? 4 : 8,
+          fontSize: compact ? 10 : 11,
+          opacity: 0.55,
+          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        }}>
+          {compact ? (
+            <span>r{mapRadius} · {count}동</span>
+          ) : (
+            <span>
+              건물 {count} · 회선 {sim.edges.length}
+              {redundantCount > 0 && <span style={{ color: '#7be6ff' }}> (이중화 {redundantCount})</span>}
+              {' · '}영역 r{mapRadius}
+            </span>
+          )}
           <button
             onClick={onReset}
             style={{
