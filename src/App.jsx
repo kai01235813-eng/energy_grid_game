@@ -1,8 +1,59 @@
-import React, { useState } from 'react';
+import { useEffect, useState } from 'react';
 import SmartGridGame from './components/SmartGridGame';
 import GridBuilder3D from './components/GridBuilder3D';
 import EducationMode from './components/EducationMode';
 import ErrorBoundary from './components/ErrorBoundary';
+
+// ────────── Fullscreen + orientation lock helpers ──────────
+// Browser-security mandate: requestFullscreen() may only run inside a user-
+// gesture handler. We wire it to every ModeSelect button click + an explicit
+// toggle in the in-game HUD. Promise rejections are swallowed because Safari
+// throws on unsupported environments and there's nothing useful to do with
+// the failure — the rotate-device overlay still guides the user.
+function activateFullscreenAndLockLandscape() {
+  const el = document.documentElement;
+  const req = el.requestFullscreen
+    || el.webkitRequestFullscreen
+    || el.msRequestFullscreen;
+  if (!req) return;
+  const result = req.call(el);
+  // requestFullscreen returns a Promise in modern browsers, void in older
+  // WebKit. Wrap defensively.
+  Promise.resolve(result)
+    .then(() => {
+      if (screen.orientation && screen.orientation.lock) {
+        screen.orientation.lock('landscape').catch(() => {});
+      }
+    })
+    .catch(() => {});
+}
+
+function exitFullscreen() {
+  const exit = document.exitFullscreen
+    || document.webkitExitFullscreen
+    || document.msExitFullscreen;
+  if (exit) exit.call(document);
+}
+
+function isInFullscreen() {
+  return !!(
+    document.fullscreenElement
+    || document.webkitFullscreenElement
+    || document.msFullscreenElement
+  );
+}
+
+// Detect iPhone specifically — iPad supports Fullscreen API, but iPhone
+// Safari does not. The only way to give iPhone users the same chrome-free
+// experience is PWA (Add-to-Home-Screen). isStandalone tells us they've
+// already installed it, so we can hide the install hint.
+function isIPhone() {
+  return /iPhone|iPod/.test(navigator.userAgent);
+}
+function isStandalonePWA() {
+  return window.navigator.standalone === true
+    || window.matchMedia('(display-mode: standalone)').matches;
+}
 
 // Mobile portrait is hostile to this UI — HUD panels and the bottom palette
 // assume a wide viewport. CSS-driven overlay (no JS resize listener needed)
@@ -23,6 +74,50 @@ function RotateDevicePrompt() {
   );
 }
 
+// Small toggle for the in-game HUD. Tracks fullscreenchange so ESC/back
+// gesture flips the icon correctly.
+function FullscreenToggle() {
+  const [fs, setFs] = useState(isInFullscreen());
+  useEffect(() => {
+    const onChange = () => setFs(isInFullscreen());
+    document.addEventListener('fullscreenchange', onChange);
+    document.addEventListener('webkitfullscreenchange', onChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', onChange);
+      document.removeEventListener('webkitfullscreenchange', onChange);
+    };
+  }, []);
+  const onClick = () => {
+    if (fs) exitFullscreen();
+    else activateFullscreenAndLockLandscape();
+  };
+  return (
+    <button
+      onClick={onClick}
+      title={fs ? '전체화면 종료' : '전체화면'}
+      style={{
+        position: 'absolute',
+        top: 12,
+        right: 12,
+        zIndex: 1000,
+        width: 32,
+        height: 32,
+        padding: 0,
+        background: 'rgba(10, 14, 39, 0.85)',
+        color: '#00d4ff',
+        border: '1px solid #00d4ff',
+        borderRadius: 6,
+        cursor: 'pointer',
+        fontSize: 16,
+        fontFamily: 'monospace',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+      }}
+    >
+      {fs ? '⤢' : '⛶'}
+    </button>
+  );
+}
+
 function App() {
   const [mode, setMode] = useState(() => {
     return localStorage.getItem('eg_mode') || 'menu';
@@ -30,6 +125,11 @@ function App() {
 
   const switchMode = (next) => {
     localStorage.setItem('eg_mode', next);
+    // Entering a play mode is the user-gesture moment when browsers will
+    // honour the Fullscreen API. Going BACK to the menu intentionally
+    // doesn't exit — the player keeps their immersive view across mode
+    // switches and can hit the toggle if they want chrome back.
+    if (next !== 'menu') activateFullscreenAndLockLandscape();
     setMode(next);
   };
 
@@ -64,6 +164,7 @@ function App() {
         >
           ← 모드 선택
         </button>
+        <FullscreenToggle />
         {mode === 'phaser' && <SmartGridGame />}
         {mode === 'r3f' && <GridBuilder3D />}
         {mode === 'edu' && <EducationMode />}
@@ -142,6 +243,23 @@ function ModeSelect({ onSelect }) {
           </div>
         </button>
       </div>
+      {/* iPhone Safari blocks Fullscreen API; the only way to give iPhone
+          users a chrome-free experience is PWA install. Skip the hint if
+          they're already running standalone. */}
+      {isIPhone() && !isStandalonePWA() && (
+        <div style={{
+          color: '#8fd', fontSize: 12, fontFamily: 'system-ui',
+          marginTop: 4, opacity: 0.9, textAlign: 'center',
+          maxWidth: 420, lineHeight: 1.6,
+          padding: '8px 14px',
+          background: 'rgba(125,230,200,0.08)',
+          border: '1px solid rgba(125,230,200,0.3)',
+          borderRadius: 8,
+        }}>
+          🍎 <b>아이폰 사용자</b>: 사파리의 [공유] → <b>"홈 화면에 추가"</b>를 누르면<br />
+          주소창 없이 가로 전체화면으로 실행됩니다.
+        </div>
+      )}
       <div style={{ color: '#456', fontSize: 11, fontFamily: 'monospace', marginTop: 12 }}>
         Models © Kenney.nl (CC0)
       </div>

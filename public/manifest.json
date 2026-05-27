@@ -1,0 +1,20 @@
+{
+  "name": "Energy Grid · 에너지그리드",
+  "short_name": "Energy Grid",
+  "description": "스마트그리드 운영 시뮬레이션 — 발전·송전·변전·배전을 직접 설계하고 사고에 대응하세요.",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#050816",
+  "theme_color": "#050816",
+  "start_url": "/",
+  "scope": "/",
+  "lang": "ko",
+  "icons": [
+    {
+      "src": "/vite.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

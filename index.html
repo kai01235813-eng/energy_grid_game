@@ -3,7 +3,28 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <!-- viewport-fit=cover lets the canvas extend behind the notch / dynamic
+         island, user-scalable=no kills the pinch-zoom that ruins the HUD. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no, maximum-scale=1.0"
+    />
+    <!-- Android Chrome paints the URL bar with this color when at the top
+         of the viewport, hiding the seam between browser chrome and game. -->
+    <meta name="theme-color" content="#050816" />
+
+    <!-- iOS PWA: when added to Home Screen the app launches without Safari
+         chrome and respects the manifest's landscape lock. -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Energy Grid" />
+    <link rel="apple-touch-icon" href="/vite.svg" />
+
+    <!-- PWA manifest — also enables Add-to-Home-Screen on Android with the
+         landscape-locked standalone window. -->
+    <link rel="manifest" href="/manifest.json" />
+
     <title>에너지그리드 (EG) - 경남 전력 효율화 RPG</title>
   </head>
   <body>
