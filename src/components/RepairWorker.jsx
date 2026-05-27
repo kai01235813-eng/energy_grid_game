@@ -1,147 +1,192 @@
-import React, { useEffect, useMemo, useRef } from 'react';
-import { useFBX } from '@react-three/drei';
-import { useLoader, useFrame } from '@react-three/fiber';
-import * as THREE from 'three';
-// three r0.160 ships SkeletonUtils as individual named exports (no namespace
-// object). Bring them in as a namespace import so SkeletonUtils.clone(...)
-// keeps working the way the original code expected.
-import * as SkeletonUtils from 'three/examples/jsm/utils/SkeletonUtils.js';
+import { useFrame } from '@react-three/fiber';
+import { useMemo, useRef } from 'react';
 
-// Kenney FBX rigs are authored in centimetres. The hex grid is metres-ish,
-// so we scale the whole worker down. Tuned so the head sits roughly at a
-// pylon's first brace level.
-const WORKER_SCALE = 0.0045;
+// ────────── Repair worker — procedural cartoon mesh ──────────
+// Replaced the Kenney FBX rig (skaterMaleA skin had an orange "face" that
+// playtesters found unsettling at game scale) with a tiny stylised
+// construction worker built from primitives:
+//
+//   • yellow safety helmet with brim + status lamp
+//   • neutral head (no facial features — avoids the uncanny-valley issue)
+//   • orange safety vest with reflective horizontal stripes
+//   • swinging arms + legs on walking, alternating arm raises on working
+//
+// Side effects: 0 asset downloads (no FBX, no texture, no SkeletonUtils),
+// much cheaper GPU load on mobile, and the worker now reads as a high-vis
+// utility crew member matching the rest of the toy-grid art direction.
 
-// Y-offset (in FBX-local cm) where the safety helmet sits — measured against
-// the imported pivot. Worker is ~180 cm tall, head crown ~170 cm.
-const HELMET_Y = 178;
+const COLORS = {
+  vest: '#ff7a28',
+  vestDark: '#d85a18',
+  pants: '#2a3d52',
+  boots: '#2a1f14',
+  skin: '#d4a87a',
+  helmet: '#ffd23f',
+  helmetBrim: '#e5b830',
+  stripe: '#fff0c8',
+};
 
-function applyTexture(root, tex) {
-  root.traverse((child) => {
-    if (child.isMesh || child.isSkinnedMesh) {
-      child.material = child.material.clone();
-      child.material.map = tex;
-      child.material.needsUpdate = true;
-      child.castShadow = true;
-    }
-  });
-}
-
-// Single worker. `position` is in world units (metres). `lookAt` is an
-// optional world-space target the worker should face. `mode` switches the
-// idle ↔ run animation crossfade.
 export default function RepairWorker({ position, lookAt, mode = 'idle' }) {
-  const rawFbx = useFBX('/characters/characterMedium.fbx');
-  const idleFbx = useFBX('/characters/idle.fbx');
-  const runFbx = useFBX('/characters/run.fbx');
-  const tex = useLoader(THREE.TextureLoader, '/characters/skaterMaleA.png');
+  const armLRef = useRef();
+  const armRRef = useRef();
+  const legLRef = useRef();
+  const legRRef = useRef();
+  const bodyRef = useRef();
 
-  // Clone the rig per worker so multiple instances don't share a skeleton.
-  // SkeletonUtils.clone is the supported way; plain .clone() would leave the
-  // skinned meshes pointing at the original bones.
-  const model = useMemo(() => {
-    tex.colorSpace = THREE.SRGBColorSpace;
-    tex.flipY = false; // Kenney FBX UV convention
-    const c = SkeletonUtils.clone(rawFbx);
-    applyTexture(c, tex);
-    return c;
-  }, [rawFbx, tex]);
-
-  // One mixer per worker instance.
-  const mixerRef = useRef();
-  const actionsRef = useRef({ idle: null, run: null });
-
-  useEffect(() => {
-    const mixer = new THREE.AnimationMixer(model);
-    mixerRef.current = mixer;
-    const idleClip = idleFbx.animations[0];
-    const runClip = runFbx.animations[0];
-    if (idleClip) {
-      const a = mixer.clipAction(idleClip);
-      a.play();
-      actionsRef.current.idle = a;
-    }
-    if (runClip) {
-      const a = mixer.clipAction(runClip);
-      a.play();
-      a.weight = 0;
-      actionsRef.current.run = a;
-    }
-    return () => {
-      mixer.stopAllAction();
-      mixer.uncacheRoot(model);
-    };
-  }, [model, idleFbx, runFbx]);
-
-  // Crossfade between idle and run based on `mode`. We keep both actions
-  // playing and just blend their weights — cheaper and more responsive than
-  // stop/start.
-  useEffect(() => {
-    const idle = actionsRef.current.idle;
-    const run = actionsRef.current.run;
-    if (!idle || !run) return;
-    const wantRun = mode === 'walking' || mode === 'returning';
-    const targetIdle = wantRun ? 0 : 1;
-    const targetRun = wantRun ? 1 : 0;
-    // simple snap; useFrame interpolates below for a soft transition
-    idle.userData = { ...(idle.userData || {}), target: targetIdle };
-    run.userData = { ...(run.userData || {}), target: targetRun };
-  }, [mode]);
-
-  useFrame((_, dt) => {
-    const mixer = mixerRef.current;
-    if (!mixer) return;
-    mixer.update(dt);
-    const idle = actionsRef.current.idle;
-    const run = actionsRef.current.run;
-    if (idle && idle.userData?.target != null) {
-      idle.weight += (idle.userData.target - idle.weight) * Math.min(1, dt * 6);
-    }
-    if (run && run.userData?.target != null) {
-      run.weight += (run.userData.target - run.weight) * Math.min(1, dt * 6);
+  // Per-frame limb animation. Walking/returning swings arms + legs in
+  // opposition; working alternates arms in a tool-swing pattern; idle holds
+  // pose. Cheap — 5 ref mutations per frame, no geometry recompute.
+  useFrame(({ clock }) => {
+    const t = clock.elapsedTime;
+    const walking = mode === 'walking' || mode === 'returning';
+    if (walking) {
+      const swing = Math.sin(t * 9) * 0.7;
+      if (armLRef.current) armLRef.current.rotation.x = swing;
+      if (armRRef.current) armRRef.current.rotation.x = -swing;
+      if (legLRef.current) legLRef.current.rotation.x = -swing * 0.7;
+      if (legRRef.current) legRRef.current.rotation.x = swing * 0.7;
+      if (bodyRef.current) {
+        bodyRef.current.position.y = 0.45 + Math.abs(Math.sin(t * 9)) * 0.025;
+      }
+    } else if (mode === 'working') {
+      // Both arms raised, alternating in a hammering / wrenching motion
+      const tool = Math.sin(t * 5) * 0.4;
+      if (armLRef.current) armLRef.current.rotation.x = -1.2 + tool;
+      if (armRRef.current) armRRef.current.rotation.x = -1.2 - tool;
+      if (legLRef.current) legLRef.current.rotation.x = 0;
+      if (legRRef.current) legRRef.current.rotation.x = 0;
+      if (bodyRef.current) bodyRef.current.position.y = 0.45;
+    } else {
+      // idle — settle to neutral pose, slight breathing bob
+      const breath = Math.sin(t * 1.8) * 0.015;
+      if (armLRef.current) armLRef.current.rotation.x = 0;
+      if (armRRef.current) armRRef.current.rotation.x = 0;
+      if (legLRef.current) legLRef.current.rotation.x = 0;
+      if (legRRef.current) legRRef.current.rotation.x = 0;
+      if (bodyRef.current) bodyRef.current.position.y = 0.45 + breath;
     }
   });
 
-  // Heading toward look-target on the xz plane. atan2(dx, dz) is the Three.js
-  // convention for rotation around Y (because the model faces -Z by default
-  // after the FBX import, we add π to flip it forward).
+  // Heading toward the look-target on the xz plane. The procedural model
+  // is built facing +Z so we use atan2(dx, dz) directly (no π flip needed,
+  // unlike the FBX rig which faced -Z).
   const rotY = useMemo(() => {
     if (!lookAt) return 0;
     const dx = lookAt[0] - position[0];
     const dz = lookAt[2] - position[2];
     if (Math.abs(dx) + Math.abs(dz) < 1e-4) return 0;
-    return Math.atan2(dx, dz) + Math.PI;
+    return Math.atan2(dx, dz);
   }, [lookAt, position]);
 
+  const lampColor = mode === 'working' ? '#ff5252' : '#ff9060';
+
   return (
-    <group position={position} rotation={[0, rotY, 0]} scale={WORKER_SCALE}>
-      <primitive object={model} />
-      {/* yellow safety helmet — boxy, Lego-ish */}
-      <group position={[0, HELMET_Y, 0]}>
+    <group position={position} rotation={[0, rotY, 0]}>
+      {/* legs — pivot at hip so rotation.x swings the leg forward/back */}
+      <group ref={legLRef} position={[-0.08, 0.22, 0]}>
+        <mesh position={[0, -0.11, 0]}>
+          <boxGeometry args={[0.11, 0.22, 0.11]} />
+          <meshLambertMaterial color={COLORS.pants} />
+        </mesh>
+        {/* boot */}
+        <mesh position={[0, -0.24, 0.02]}>
+          <boxGeometry args={[0.13, 0.06, 0.17]} />
+          <meshLambertMaterial color={COLORS.boots} />
+        </mesh>
+      </group>
+      <group ref={legRRef} position={[0.08, 0.22, 0]}>
+        <mesh position={[0, -0.11, 0]}>
+          <boxGeometry args={[0.11, 0.22, 0.11]} />
+          <meshLambertMaterial color={COLORS.pants} />
+        </mesh>
+        <mesh position={[0, -0.24, 0.02]}>
+          <boxGeometry args={[0.13, 0.06, 0.17]} />
+          <meshLambertMaterial color={COLORS.boots} />
+        </mesh>
+      </group>
+
+      {/* torso (body) — pivots from below so the walking bob feels natural */}
+      <group ref={bodyRef} position={[0, 0.45, 0]}>
+        {/* safety vest */}
         <mesh>
-          <boxGeometry args={[38, 18, 40]} />
-          <meshStandardMaterial color="#ffd23f" roughness={0.4} metalness={0.1} />
+          <boxGeometry args={[0.32, 0.34, 0.20]} />
+          <meshLambertMaterial color={COLORS.vest} />
         </mesh>
-        {/* visor brim */}
-        <mesh position={[0, -7, 14]}>
-          <boxGeometry args={[44, 4, 10]} />
-          <meshStandardMaterial color="#ffd23f" roughness={0.5} />
+        {/* darker side panels for shading without lights */}
+        <mesh position={[0, -0.05, 0]}>
+          <boxGeometry args={[0.34, 0.06, 0.21]} />
+          <meshLambertMaterial color={COLORS.vestDark} />
         </mesh>
-        {/* tiny status lamp on the front */}
-        <mesh position={[0, 4, 19]}>
-          <sphereGeometry args={[3.5, 10, 10]} />
-          <meshStandardMaterial
-            color="#ff5252"
-            emissive="#ff5252"
-            emissiveIntensity={mode === 'working' ? 2.4 : 0.6}
+        {/* reflective horizontal stripes (front + back) */}
+        <mesh position={[0, 0.05, 0.101]}>
+          <boxGeometry args={[0.33, 0.04, 0.002]} />
+          <meshBasicMaterial color={COLORS.stripe} />
+        </mesh>
+        <mesh position={[0, 0.05, -0.101]}>
+          <boxGeometry args={[0.33, 0.04, 0.002]} />
+          <meshBasicMaterial color={COLORS.stripe} />
+        </mesh>
+        <mesh position={[0, -0.10, 0.101]}>
+          <boxGeometry args={[0.33, 0.03, 0.002]} />
+          <meshBasicMaterial color={COLORS.stripe} />
+        </mesh>
+        <mesh position={[0, -0.10, -0.101]}>
+          <boxGeometry args={[0.33, 0.03, 0.002]} />
+          <meshBasicMaterial color={COLORS.stripe} />
+        </mesh>
+      </group>
+
+      {/* arms — anchor at shoulder so rotation.x swings the whole arm */}
+      <group ref={armLRef} position={[-0.205, 0.6, 0]}>
+        <mesh position={[0, -0.13, 0]}>
+          <boxGeometry args={[0.08, 0.26, 0.08]} />
+          <meshLambertMaterial color={COLORS.vest} />
+        </mesh>
+        {/* glove */}
+        <mesh position={[0, -0.28, 0]}>
+          <sphereGeometry args={[0.055, 8, 6]} />
+          <meshLambertMaterial color={COLORS.boots} />
+        </mesh>
+      </group>
+      <group ref={armRRef} position={[0.205, 0.6, 0]}>
+        <mesh position={[0, -0.13, 0]}>
+          <boxGeometry args={[0.08, 0.26, 0.08]} />
+          <meshLambertMaterial color={COLORS.vest} />
+        </mesh>
+        <mesh position={[0, -0.28, 0]}>
+          <sphereGeometry args={[0.055, 8, 6]} />
+          <meshLambertMaterial color={COLORS.boots} />
+        </mesh>
+      </group>
+
+      {/* head — featureless cap of skin tone, mostly covered by the helmet.
+          No eyes/mouth = no uncanny look. */}
+      <mesh position={[0, 0.74, 0]}>
+        <sphereGeometry args={[0.10, 12, 10]} />
+        <meshLambertMaterial color={COLORS.skin} />
+      </mesh>
+
+      {/* helmet — yellow hard hat with a wide brim and a small status lamp.
+          Built from a half-sphere + a thin brim disc to read as a 안전모. */}
+      <group position={[0, 0.78, 0]}>
+        <mesh>
+          <sphereGeometry
+            args={[0.13, 14, 10, 0, Math.PI * 2, 0, Math.PI / 2]}
           />
+          <meshLambertMaterial color={COLORS.helmet} />
+        </mesh>
+        {/* brim — slightly larger cylinder slab around the head */}
+        <mesh position={[0, 0, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+          <cylinderGeometry args={[0.155, 0.155, 0.025, 14]} />
+          <meshLambertMaterial color={COLORS.helmetBrim} />
+        </mesh>
+        {/* status lamp on the front of the helmet — red while working,
+            warm orange while walking/idle */}
+        <mesh position={[0, 0.06, 0.11]}>
+          <sphereGeometry args={[0.025, 8, 6]} />
+          <meshBasicMaterial color={lampColor} />
         </mesh>
       </group>
     </group>
   );
 }
-
-// Preload — avoids the first-spawn FBX parse stall when a fault is dispatched.
-useFBX.preload('/characters/characterMedium.fbx');
-useFBX.preload('/characters/idle.fbx');
-useFBX.preload('/characters/run.fbx');
