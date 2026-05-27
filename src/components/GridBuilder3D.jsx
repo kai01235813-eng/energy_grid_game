@@ -1753,92 +1753,33 @@ function PulsingTargetHalo({ position, onPick }) {
 }
 
 // ────────── 햇빛소득마을 visual ──────────
-// Golden light-pillar effect at the cluster centroid. Cheap by design —
-// one ring + one pillar mesh + one floating sun + one pointLight, all
-// hand-animated via a single useFrame. Sized so it's unmistakable from any
-// reasonable camera distance, but not so loud it covers the panels themselves.
-function SunshineVillage({ position, count }) {
-  const groupRef = useRef();
-  const sunRef = useRef();
+// Minimal cluster marker — earlier version had a pillar, spinning sun, and
+// bead crown which playtesters called "too much". Now just a faint golden
+// ring on the ground (gently breathing) plus one soft warm pointLight so
+// the panels themselves look a bit more lit. Achievement toast carries the
+// "you did it!" feedback; the ring just marks the footprint persistently.
+function SunshineVillage({ position }) {
   const ringRef = useRef();
-  const lightRef = useRef();
   useFrame(({ clock }) => {
+    if (!ringRef.current) return;
     const t = clock.elapsedTime;
-    // Sun bobs and spins gently
-    if (sunRef.current) {
-      sunRef.current.position.y = 2.6 + Math.sin(t * 1.4) * 0.18;
-      sunRef.current.rotation.y = t * 0.6;
-      const s = 1 + 0.08 * Math.sin(t * 3.3);
-      sunRef.current.scale.setScalar(s);
-    }
-    // Ring pulses outward — scale loop
-    if (ringRef.current) {
-      const phase = (t * 0.6) % 1;
-      ringRef.current.scale.setScalar(0.7 + phase * 0.7);
-      ringRef.current.material.opacity = 0.5 * (1 - phase);
-    }
-    // Light intensity throbs subtly
-    if (lightRef.current) {
-      lightRef.current.intensity = 3.2 + Math.sin(t * 2.0) * 0.6;
-    }
+    ringRef.current.material.opacity = 0.22 + Math.sin(t * 1.3) * 0.08;
   });
   return (
-    <group ref={groupRef} position={position}>
-      {/* fixed golden ring on the ground (the village footprint) */}
-      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.05, 0]}>
-        <ringGeometry args={[0.9, 1.2, 32]} />
-        <meshBasicMaterial color="#ffd86b" transparent opacity={0.6} />
+    <group position={position}>
+      <mesh ref={ringRef} rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.06, 0]}>
+        <ringGeometry args={[0.85, 1.0, 24]} />
+        <meshBasicMaterial color="#ffd86b" transparent opacity={0.3} />
       </mesh>
-      {/* pulsing outer ring */}
-      <mesh ref={ringRef} rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.05, 0]}>
-        <ringGeometry args={[1.0, 1.05, 32]} />
-        <meshBasicMaterial color="#fff080" transparent opacity={0.5} />
-      </mesh>
-      {/* vertical light pillar */}
-      <mesh position={[0, 4, 0]}>
-        <cylinderGeometry args={[0.5, 1.0, 8, 16, 1, true]} />
-        <meshBasicMaterial color="#ffd86b" transparent opacity={0.13} side={THREE.DoubleSide} depthWrite={false} />
-      </mesh>
-      {/* floating sun icon */}
-      <group ref={sunRef} position={[0, 2.6, 0]}>
-        <mesh>
-          <sphereGeometry args={[0.35, 16, 12]} />
-          <meshBasicMaterial color="#fff080" />
-        </mesh>
-        {/* sun rays — 8 small spikes around the sphere */}
-        {Array.from({ length: 8 }).map((_, i) => {
-          const a = (i / 8) * Math.PI * 2;
-          return (
-            <mesh
-              key={i}
-              position={[Math.cos(a) * 0.5, 0, Math.sin(a) * 0.5]}
-              rotation={[0, -a, 0]}
-            >
-              <coneGeometry args={[0.06, 0.22, 4]} />
-              <meshBasicMaterial color="#ffe060" />
-            </mesh>
-          );
-        })}
-      </group>
-      {/* warm village light */}
+      {/* low-intensity warm light → panels read as slightly brighter than
+          stand-alone solars, without flooding the scene */}
       <pointLight
-        ref={lightRef}
-        position={[0, 2.5, 0]}
+        position={[0, 1.6, 0]}
         color="#ffd86b"
-        intensity={3.2}
-        distance={7}
+        intensity={1.0}
+        distance={4.5}
         decay={2}
       />
-      {/* small "panels" count beads on the rim for at-a-glance scale */}
-      {Array.from({ length: Math.min(count, 8) }).map((_, i) => {
-        const a = (i / 8) * Math.PI * 2;
-        return (
-          <mesh key={`bead-${i}`} position={[Math.cos(a) * 1.35, 0.18, Math.sin(a) * 1.35]}>
-            <sphereGeometry args={[0.07, 8, 6]} />
-            <meshBasicMaterial color="#ff9040" />
-          </mesh>
-        );
-      })}
     </group>
   );
 }
@@ -3551,6 +3492,188 @@ function DifficultyMeter({ difficulty }) {
   );
 }
 
+// ────────── Tutorial / rules modal ──────────
+// One-time first-launch tutorial + always-available "?" button. Bumping
+// TUTORIAL_VERSION re-shows the modal to returning players so they catch
+// significant rule changes.
+const TUTORIAL_KEY = 'eg_tutorial_seen_v1';
+const TUTORIAL_SECTIONS = [
+  {
+    icon: '🎯',
+    title: '목표',
+    lines: [
+      '발전 → 송전 → 변전 → 배전 → 가정까지 직접 설계하고,',
+      '주파수 60.0±0.5 Hz를 유지하며 사고에 대응해 점수를 누적합니다.',
+      '점수 = 자금 + (생존 시간 × 5). 초기화하면 랭킹에 등록됩니다.',
+    ],
+  },
+  {
+    icon: '🖱️',
+    title: '조작',
+    lines: [
+      '클릭 = 선택한 타입으로 배치',
+      '같은 타입으로 두 번 클릭 = 매각(60% 환불) · 카메라 조작 중 오작동 방지',
+      '드래그 = 회전, 휠 = 줌',
+    ],
+  },
+  {
+    icon: '⚡',
+    title: '전력 계통 연결 규칙',
+    lines: [
+      '발전소·송전탑·변전소·전신주는 같은 전압끼리만 직결',
+      '변전소만이 고압 ↔ 저압을 잇는 유일한 다리',
+      '발전기↔발전기, 소비처↔소비처 직결 불가 (실제 계통과 동일)',
+      '주파수가 ±0.5 Hz 안일 때만 수익이 들어옵니다',
+    ],
+  },
+  {
+    icon: '🌞',
+    title: '스마트그리드',
+    lines: [
+      '태양광·풍력: 자동 출력제어로 과공급 자동 감쇠',
+      '소규모(1~2기)는 전신주·가정에 직접, 대규모(3기+ 단지)는 송전탑/변전소 필수',
+      'ESS: 변전소·전신주·데이터센터에 연결 → 자동 충방전으로 주파수 보조',
+      '태양광 3기를 가까이 모으면 햇빛소득마을 → 일회 보너스 + 분당 수익',
+    ],
+  },
+  {
+    icon: '🏢',
+    title: '데이터센터 (특수설비)',
+    lines: [
+      '−180 MW의 거대 부하 — 단일 변전소 라디알 급전 시 페널티',
+      '변전소 2곳 이상 또는 송전탑 2회선 이상 환상망 구성 필요',
+      '반경 2헥스 내 태양광+풍력+ESS 모두 = RE100 +20% 수익 가산',
+      '반경 내 스마트그리드 2개+ = VPP 수요 30% 감면',
+    ],
+  },
+  {
+    icon: '🚨',
+    title: '사고 대응',
+    lines: [
+      '🐦 까마귀 — 송전탑/전신주를 클릭해 쫓기',
+      '🔥 산불 — 송전탑을 클릭해 진화',
+      '⚡ 낙뢰 — 자동 회복(3초). 인접 헥스가 잠시 정전',
+      '🔧 선로 고장 · 🚁 헬기 추락 — ⚠ 마커 클릭 → 변전소에서 작업자 출동',
+      '🚧 지장전주 — 콘 클릭 → 녹색 후광 헥스 클릭으로 이설',
+      '이중화(N-1): 송전탑↔송전탑 회선 중간 점 클릭 → 한쪽 끊겨도 부하절체로 무중단',
+    ],
+  },
+  {
+    icon: '🔥',
+    title: '콤보 · 난이도 · 회생',
+    lines: [
+      '주파수 안정 유지 시간 = 콤보. 120초 만점 시 수익 ×2.0',
+      '1분당 ×1.1 난이도 (사고 빈도 증가, 캡 5×)',
+      '자금이 마이너스여도 건설 가능. 사고 드레인은 −₩500 하한선',
+      '같은 타입 두 번 클릭으로 60% 환불 받아 회생',
+    ],
+  },
+];
+
+function TutorialModal({ onClose, compact }) {
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: 'absolute',
+        inset: 0,
+        zIndex: 10000,
+        background: 'rgba(5, 8, 22, 0.85)',
+        backdropFilter: 'blur(4px)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: compact ? 12 : 24,
+        fontFamily: 'system-ui',
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          maxWidth: compact ? '100%' : 720,
+          width: '100%',
+          maxHeight: compact ? '100%' : '90vh',
+          background: 'rgba(12, 16, 32, 0.97)',
+          border: '1px solid #2a3a5e',
+          borderRadius: compact ? 10 : 16,
+          color: '#e6f7ff',
+          overflow: 'hidden',
+          display: 'flex',
+          flexDirection: 'column',
+        }}
+      >
+        {/* Header */}
+        <div style={{
+          padding: compact ? '10px 14px' : '16px 22px',
+          borderBottom: '1px solid #2a3a5e',
+          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+          flexShrink: 0,
+        }}>
+          <div>
+            <div style={{
+              color: '#00d4ff', fontWeight: 700,
+              fontSize: compact ? 16 : 20, letterSpacing: 1,
+            }}>
+              ⚡ Energy Grid · 게임 규칙
+            </div>
+            <div style={{ color: '#7aa', fontSize: 11, marginTop: 2 }}>
+              튜토리얼은 우상단 HUD의 ? 버튼으로 언제든 다시 열 수 있습니다
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            style={{
+              background: 'transparent', color: '#00d4ff',
+              border: '1px solid #00d4ff', borderRadius: 6,
+              padding: '6px 14px', cursor: 'pointer',
+              fontSize: compact ? 11 : 13, fontWeight: 600,
+              fontFamily: 'system-ui',
+            }}
+          >
+            시작하기 →
+          </button>
+        </div>
+
+        {/* Scrollable body */}
+        <div style={{
+          padding: compact ? '12px 14px' : '18px 22px',
+          overflowY: 'auto',
+          fontSize: compact ? 11 : 13,
+          lineHeight: 1.6,
+        }}>
+          {TUTORIAL_SECTIONS.map((s, i) => (
+            <div key={i} style={{ marginBottom: compact ? 14 : 18 }}>
+              <div style={{
+                color: '#7fc8ff', fontWeight: 700,
+                fontSize: compact ? 13 : 15,
+                marginBottom: 6,
+                display: 'flex', gap: 8, alignItems: 'center',
+              }}>
+                <span style={{ fontSize: compact ? 16 : 20 }}>{s.icon}</span>
+                <span>{s.title}</span>
+              </div>
+              <ul style={{
+                margin: 0, paddingLeft: compact ? 20 : 24,
+                color: '#cde', opacity: 0.92,
+              }}>
+                {s.lines.map((line, j) => (
+                  <li key={j} style={{ marginBottom: 3 }}>{line}</li>
+                ))}
+              </ul>
+            </div>
+          ))}
+          <div style={{
+            color: '#456', fontSize: 10, textAlign: 'center',
+            marginTop: 8, padding: 10,
+            background: 'rgba(255,255,255,0.03)',
+            borderRadius: 6,
+          }}>
+            막히면 좌상단 안내(advisor) 카드가 현재 상황에 맞는 다음 행동을 알려줍니다.
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Persisted ranking from localStorage. Sorted by `score` desc. The current
 // run is shown as a ghost row so the player can see where they'd land if
 // they reset right now.
@@ -3670,6 +3793,16 @@ function UI({
 }) {
   const [showBoard, setShowBoard] = useState(false);
   const compact = useIsCompact();
+  // Tutorial modal — auto-shown on first launch (localStorage flag), and
+  // re-openable anytime via the "?" HUD button.
+  const [showTutorial, setShowTutorial] = useState(() => {
+    try { return localStorage.getItem(TUTORIAL_KEY) !== '1'; }
+    catch (_) { return false; }
+  });
+  const closeTutorial = () => {
+    setShowTutorial(false);
+    try { localStorage.setItem(TUTORIAL_KEY, '1'); } catch (_) {}
+  };
 
   // Live advisor tip — recomputed whenever the relevant slice of state moves.
   // Deps kept narrow so we don't churn the tip every dyn pulse.
@@ -3821,15 +3954,27 @@ function UI({
             display: 'flex', justifyContent: 'space-between', alignItems: 'center',
           }}>
             <span>RANK · 점수</span>
-            <button
-              onClick={() => setShowBoard((v) => !v)}
-              style={{
-                background: 'transparent', color: '#7fc8ff',
-                border: '1px solid #7fc8ff', borderRadius: 4,
-                padding: '1px 8px', cursor: 'pointer', fontSize: 10,
-                fontFamily: 'system-ui',
-              }}
-            >{showBoard ? '닫기' : '🏆'}</button>
+            <div style={{ display: 'flex', gap: 4 }}>
+              <button
+                onClick={() => setShowTutorial(true)}
+                title="게임 규칙 / 튜토리얼"
+                style={{
+                  background: 'transparent', color: '#7fc8ff',
+                  border: '1px solid #7fc8ff', borderRadius: 4,
+                  padding: '1px 8px', cursor: 'pointer', fontSize: 10,
+                  fontFamily: 'system-ui', fontWeight: 700,
+                }}
+              >?</button>
+              <button
+                onClick={() => setShowBoard((v) => !v)}
+                style={{
+                  background: 'transparent', color: '#7fc8ff',
+                  border: '1px solid #7fc8ff', borderRadius: 4,
+                  padding: '1px 8px', cursor: 'pointer', fontSize: 10,
+                  fontFamily: 'system-ui',
+                }}
+              >{showBoard ? '닫기' : '🏆'}</button>
+            </div>
           </div>
           <div style={{
             fontSize: 18, fontFamily: 'monospace',
@@ -3974,6 +4119,11 @@ function UI({
           currentMoney={dyn.money}
           onClose={() => setShowBoard(false)}
         />
+      )}
+
+      {/* Tutorial / rules — auto on first run, ? button anytime */}
+      {showTutorial && (
+        <TutorialModal onClose={closeTutorial} compact={compact} />
       )}
 
       {/* Hover tooltip — info about the hex under the cursor */}

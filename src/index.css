@@ -46,14 +46,27 @@
     overflow: hidden;
     height: 100%;
     width: 100%;
+    margin: 0;
+    padding: 0;
   }
   #root {
     width: 100vh;
     height: 100vw;
-    position: absolute;
+    position: fixed;
     top: 50%;
     left: 50%;
     transform-origin: center center;
     transform: translate(-50%, -50%) rotate(90deg);
+    overflow: hidden;
+  }
+  /* Children of #root (ModeSelect, game wrapper) use inline 100vw/100vh,
+     which still reference the ACTUAL (un-rotated) viewport — they end up
+     90° off from the rotated #root and get clipped on the right side.
+     Force them to fill #root via percentages so they pick up the rotated
+     frame's true width/height. */
+  #root > * {
+    width: 100% !important;
+    height: 100% !important;
+    box-sizing: border-box;
   }
 }
